@@ -59,16 +59,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Injury cache ─────────────────────────────────────────────────────────────
+# ─── Injury / Suspension cache ────────────────────────────────────────────────
 
 _injury_cache: Dict[str, str] = {}
 _injury_cache_reason: Dict[str, str] = {}
+_injury_cache_type: Dict[str, str] = {}   # stores ESPN "type" field
 _injury_cache_time: float = 0
 INJURY_CACHE_TTL = 7200  # 2 hours
 
 
 def fetch_injury_report() -> Dict[str, str]:
-    global _injury_cache, _injury_cache_reason, _injury_cache_time
+    global _injury_cache, _injury_cache_reason, _injury_cache_type, _injury_cache_time
 
     now = time.time()
     if _injury_cache and (now - _injury_cache_time) < INJURY_CACHE_TTL:
@@ -87,22 +88,27 @@ def fetch_injury_report() -> Dict[str, str]:
         data = resp.json()
         new_cache: Dict[str, str] = {}
         new_reason: Dict[str, str] = {}
+        new_type: Dict[str, str] = {}
 
         for team in data.get("injuries", []):
             for injury in team.get("injuries", []):
                 athlete = injury.get("athlete", {})
                 full_name = athlete.get("displayName", "").lower().strip()
                 status = injury.get("status", "").strip()
+                # ESPN returns a "type" field that can be "suspension", "injury", etc.
+                injury_type = injury.get("type", "").lower().strip()
                 reason = injury.get("longComment", injury.get("shortComment", "")).strip()
 
                 if full_name and status:
                     key = strip_accents(full_name)
                     new_cache[key] = status
+                    new_type[key] = injury_type
                     if reason:
                         new_reason[key] = reason
 
         _injury_cache = new_cache
         _injury_cache_reason = new_reason
+        _injury_cache_type = new_type
         _injury_cache_time = now
         print(f"Injury cache refreshed: {len(new_cache)} players")
         return _injury_cache
@@ -113,12 +119,14 @@ def fetch_injury_report() -> Dict[str, str]:
 
 
 def get_injury_status(full_name: str) -> Optional[tuple]:
-    cache = fetch_injury_report()
+    """Returns (status, reason, type) or None if not listed."""
+    fetch_injury_report()
     key = strip_accents(full_name.lower().strip())
-    status = cache.get(key)
+    status = _injury_cache.get(key)
     reason = _injury_cache_reason.get(key, "")
+    injury_type = _injury_cache_type.get(key, "")
     if status:
-        return (status, reason)
+        return (status, reason, injury_type)
     return None
 
 
@@ -131,13 +139,21 @@ def strip_accents(s: str) -> str:
     )
 
 
-def is_unavailable(status_lower: str) -> bool:
-    """Returns True if player cannot play (out, suspended, gtd-out, etc)."""
-    return any(k in status_lower for k in ["out", "suspension", "suspended", "inactive"])
+def is_suspension(status: str, injury_type: str) -> bool:
+    """Detect suspension via ESPN type field OR status/reason keywords."""
+    combined = (status + " " + injury_type).lower()
+    return any(k in combined for k in ["suspension", "suspended", "disciplinary"])
 
 
-def is_questionable(status_lower: str) -> bool:
-    return "questionable" in status_lower or "doubtful" in status_lower
+def is_unavailable(status: str, injury_type: str) -> bool:
+    """Player cannot play — out, suspended, inactive."""
+    if is_suspension(status, injury_type):
+        return True
+    return any(k in status.lower() for k in ["out", "inactive"])
+
+
+def is_questionable(status: str) -> bool:
+    return any(k in status.lower() for k in ["questionable", "doubtful"])
 
 
 # ─── Nickname map ─────────────────────────────────────────────────────────────
@@ -724,6 +740,11 @@ def optimize_lineup(request: LineupOptimizeRequest):
         def fetch_player_data(p):
             pid = p['id']
             try:
+                # ── Use get_draftroom_score() for consistency with homepage ──
+                dr_result = get_draftroom_score(player_id=pid, season=request.season)
+                dr_score = dr_result["draftroom_score"]
+
+                # ── Game log for supporting metrics ──
                 gamelog = playergamelog.PlayerGameLog(player_id=pid, season=request.season, timeout=10)
                 data = gamelog.get_normalized_dict()
                 games = data.get("PlayerGameLog", [])
@@ -754,6 +775,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 else:
                     min_trend = "down"
 
+                # DR trend using per-game scores
                 def normalize(val, min_val, max_val):
                     return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
 
@@ -786,7 +808,6 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 last3_dr = sum(game_scores[:3]) / 3
                 prev7_dr = sum(game_scores[3:]) / len(game_scores[3:]) if len(game_scores) > 3 else last3_dr
                 dr_delta = last3_dr - prev7_dr
-                dr_score = sum(game_scores) / len(game_scores)
 
                 if abs(dr_delta) < 2.0:
                     dr_trend = "stable"
@@ -846,24 +867,33 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     position = ''
                     team_abbr = ''
 
-                # Injury / suspension status
+                # Injury / suspension
                 injury_info = get_injury_status(p['full_name'])
                 injury_status = injury_info[0] if injury_info else None
                 injury_reason = injury_info[1] if injury_info else None
+                injury_type = injury_info[2] if injury_info else ""
 
                 # Build reasons
                 reasons = []
 
                 if injury_status:
-                    status_lower = injury_status.lower()
-                    if is_unavailable(status_lower):
-                        label = "SUSPENDED" if "suspend" in status_lower else "OUT"
+                    suspended = is_suspension(injury_status, injury_type)
+                    unavailable = is_unavailable(injury_status, injury_type)
+                    questionable = is_questionable(injury_status)
+
+                    if suspended:
                         if injury_reason:
                             short = injury_reason.split(";")[0].replace("Injury/Illness - ", "").strip()
-                            reasons.append(f"{label} — {short} ⚠️")
+                            reasons.append(f"SUSPENDED — {short} ⚠️")
                         else:
-                            reasons.append(f"{label} ⚠️")
-                    elif is_questionable(status_lower):
+                            reasons.append("SUSPENDED ⚠️")
+                    elif unavailable:
+                        if injury_reason:
+                            short = injury_reason.split(";")[0].replace("Injury/Illness - ", "").strip()
+                            reasons.append(f"OUT — {short} ⚠️")
+                        else:
+                            reasons.append("OUT ⚠️")
+                    elif questionable:
                         if injury_reason:
                             short = injury_reason.split(";")[0].replace("Injury/Illness - ", "").strip()
                             reasons.append(f"QUESTIONABLE — {short} ⚠️")
@@ -871,7 +901,8 @@ def optimize_lineup(request: LineupOptimizeRequest):
                             reasons.append("QUESTIONABLE ⚠️")
 
                 # Only add performance reasons if player is available
-                if not injury_status or (injury_status and not is_unavailable(injury_status.lower())):
+                player_unavailable = injury_status and is_unavailable(injury_status, injury_type)
+                if not player_unavailable:
                     if dr_score >= 75:
                         reasons.append("Elite DR Score")
                     elif dr_score >= 65:
@@ -894,14 +925,13 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     elif rest_days == 0:
                         reasons.append("Back-To-Back — Fatigue Risk")
 
-                # Start score
+                # Start score — based on consistent dr_score from get_draftroom_score()
                 start_score = dr_score
 
                 if injury_status:
-                    status_lower = injury_status.lower()
-                    if is_unavailable(status_lower):
+                    if is_unavailable(injury_status, injury_type):
                         start_score -= 50
-                    elif is_questionable(status_lower):
+                    elif is_questionable(injury_status):
                         start_score -= 10
 
                 if matchup_boost is True:
@@ -922,7 +952,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     "name": p['full_name'],
                     "position": position,
                     "team": team_abbr,
-                    "dr_score": round(dr_score, 1),
+                    "dr_score": dr_score,  # consistent with homepage
                     "dr_trend": dr_trend,
                     "dr_delta": round(dr_delta, 1),
                     "minutes_avg": round(avg_min, 1),
@@ -968,17 +998,15 @@ def optimize_lineup(request: LineupOptimizeRequest):
 
         # Assign tiers
         for i, r in enumerate(valid):
-            injury_status = r.get("injury_status", "")
-            status_lower = (injury_status or "").lower()
+            injury_status = r.get("injury_status", "") or ""
+            injury_type = r.get("injury_reason", "") or ""
 
-            # Unavailable players always get Injured or Suspended tier
-            if injury_status and is_unavailable(status_lower):
+            if is_unavailable(injury_status, injury_type):
                 r["recommended_start"] = False
-                r["tier"] = "Suspended" if "suspend" in status_lower else "Injured"
+                r["tier"] = "Suspended" if is_suspension(injury_status, injury_type) else "Injured"
                 continue
 
             score = r["start_score"]
-
             if i < 5:
                 r["recommended_start"] = True
                 if score >= 75:
