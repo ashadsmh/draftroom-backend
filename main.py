@@ -60,7 +60,7 @@ app.add_middleware(
 )
 
 # ─── Injury cache ─────────────────────────────────────────────────────────────
-# Stores {last_name_first_name: status} e.g. {"curry_stephen": "Out"}
+
 _injury_cache: Dict[str, str] = {}
 _injury_cache_reason: Dict[str, str] = {}
 _injury_cache_time: float = 0
@@ -68,11 +68,6 @@ INJURY_CACHE_TTL = 7200  # 2 hours
 
 
 def fetch_injury_report() -> Dict[str, str]:
-    """
-    Scrape ESPN's NBA injury page JSON feed.
-    Returns dict keyed by 'lastname_firstname' -> status string.
-    Cached for 2 hours. Fails silently — returns empty dict on any error.
-    """
     global _injury_cache, _injury_cache_reason, _injury_cache_time
 
     now = time.time()
@@ -101,7 +96,6 @@ def fetch_injury_report() -> Dict[str, str]:
                 reason = injury.get("longComment", injury.get("shortComment", "")).strip()
 
                 if full_name and status:
-                    # Key by full name normalized
                     key = strip_accents(full_name)
                     new_cache[key] = status
                     if reason:
@@ -119,9 +113,6 @@ def fetch_injury_report() -> Dict[str, str]:
 
 
 def get_injury_status(full_name: str) -> Optional[tuple]:
-    """
-    Returns (status, reason) or None if player is healthy/not listed.
-    """
     cache = fetch_injury_report()
     key = strip_accents(full_name.lower().strip())
     status = cache.get(key)
@@ -131,13 +122,22 @@ def get_injury_status(full_name: str) -> Optional[tuple]:
     return None
 
 
-# ─── Accent stripping ─────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def strip_accents(s: str) -> str:
     return ''.join(
         c for c in unicodedata.normalize('NFD', s)
         if unicodedata.category(c) != 'Mn'
     )
+
+
+def is_unavailable(status_lower: str) -> bool:
+    """Returns True if player cannot play (out, suspended, gtd-out, etc)."""
+    return any(k in status_lower for k in ["out", "suspension", "suspended", "inactive"])
+
+
+def is_questionable(status_lower: str) -> bool:
+    return "questionable" in status_lower or "doubtful" in status_lower
 
 
 # ─── Nickname map ─────────────────────────────────────────────────────────────
@@ -237,6 +237,8 @@ NICKNAME_MAP = {
     "vucevic": "nikola vucevic",
 }
 
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/players/search", summary="Search for NBA players by name")
 def search_players(query: str = Query(..., min_length=1)):
@@ -716,8 +718,8 @@ def optimize_lineup(request: LineupOptimizeRequest):
         if not resolved:
             raise HTTPException(status_code=422, detail="Could not resolve any player names.")
 
-        # Pre-fetch injury report once (cached)
-        injury_report = fetch_injury_report()
+        # Pre-fetch injury report once (cached 2hrs)
+        fetch_injury_report()
 
         def fetch_player_data(p):
             pid = p['id']
@@ -800,7 +802,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 dreb = sum(g.get('DREB') or 0 for g in recent) / len(recent)
                 oreb = sum(g.get('OREB') or 0 for g in recent) / len(recent)
 
-                # Rest days — days since last game
+                # Rest days
                 rest_days = None
                 try:
                     last_game_date = games[0].get("GAME_DATE", "")
@@ -844,7 +846,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     position = ''
                     team_abbr = ''
 
-                # Injury status
+                # Injury / suspension status
                 injury_info = get_injury_status(p['full_name'])
                 injury_status = injury_info[0] if injury_info else None
                 injury_reason = injury_info[1] if injury_info else None
@@ -852,39 +854,42 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 # Build reasons
                 reasons = []
 
-                # Injury — always first if present
                 if injury_status:
-                    status_upper = injury_status.upper()
-                    if injury_reason:
-                        short_reason = injury_reason.split(";")[0].replace("Injury/Illness - ", "").strip()
-                        reasons.append(f"{status_upper} — {short_reason} ⚠️")
-                    else:
-                        reasons.append(f"{status_upper} ⚠️")
+                    status_lower = injury_status.lower()
+                    if is_unavailable(status_lower):
+                        label = "SUSPENDED" if "suspend" in status_lower else "OUT"
+                        if injury_reason:
+                            short = injury_reason.split(";")[0].replace("Injury/Illness - ", "").strip()
+                            reasons.append(f"{label} — {short} ⚠️")
+                        else:
+                            reasons.append(f"{label} ⚠️")
+                    elif is_questionable(status_lower):
+                        if injury_reason:
+                            short = injury_reason.split(";")[0].replace("Injury/Illness - ", "").strip()
+                            reasons.append(f"QUESTIONABLE — {short} ⚠️")
+                        else:
+                            reasons.append("QUESTIONABLE ⚠️")
 
-                # DR quality label
-                if dr_score >= 75:
-                    reasons.append("Elite DR Score")
-                elif dr_score >= 65:
-                    reasons.append("Strong DR Score")
+                # Only add performance reasons if player is available
+                if not injury_status or (injury_status and not is_unavailable(injury_status.lower())):
+                    if dr_score >= 75:
+                        reasons.append("Elite DR Score")
+                    elif dr_score >= 65:
+                        reasons.append("Strong DR Score")
 
-                # DR trend
-                if dr_trend == "up" and abs(dr_delta) >= 3:
-                    reasons.append(f"+{dr_delta:.1f} DR Over Last 3 Games — Trending Up")
-                elif dr_trend == "down" and abs(dr_delta) >= 3:
-                    reasons.append(f"{dr_delta:.1f} DR Over Last 3 Games — Trending Down")
+                    if dr_trend == "up" and abs(dr_delta) >= 3:
+                        reasons.append(f"+{dr_delta:.1f} DR Over Last 3 Games — Trending Up")
+                    elif dr_trend == "down" and abs(dr_delta) >= 3:
+                        reasons.append(f"{dr_delta:.1f} DR Over Last 3 Games — Trending Down")
 
-                # Minutes trend
-                if min_trend == "up" and abs(min_delta) >= 2:
-                    reasons.append(f"Minutes Up {min_delta:.1f} MPG — Increased Role")
-                elif min_trend == "down" and abs(min_delta) >= 2:
-                    reasons.append(f"Minutes Down {abs(min_delta):.1f} MPG — Reduced Role, Monitor")
+                    if min_trend == "up" and abs(min_delta) >= 2:
+                        reasons.append(f"Minutes Up {min_delta:.1f} MPG — Increased Role")
+                    elif min_trend == "down" and abs(min_delta) >= 2:
+                        reasons.append(f"Minutes Down {abs(min_delta):.1f} MPG — Reduced Role, Monitor")
 
-                # Matchup
-                reasons.append(matchup_label)
+                    reasons.append(matchup_label)
 
-                # Rest advantage — only show if reasonable (not injured, not 40+ days)
-                if rest_days is not None and not injury_status:
-                    if 2 <= rest_days <= 14:
+                    if rest_days is not None and 2 <= rest_days <= 14:
                         reasons.append(f"{rest_days} Days Rest — Fresh Legs")
                     elif rest_days == 0:
                         reasons.append("Back-To-Back — Fatigue Risk")
@@ -892,15 +897,12 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 # Start score
                 start_score = dr_score
 
-                # Injured players should never be recommended starters
                 if injury_status:
                     status_lower = injury_status.lower()
-                    if "out" in status_lower:
+                    if is_unavailable(status_lower):
                         start_score -= 50
-                    elif "questionable" in status_lower:
+                    elif is_questionable(status_lower):
                         start_score -= 10
-                    elif "probable" in status_lower:
-                        start_score -= 3
 
                 if matchup_boost is True:
                     start_score += 4
@@ -964,12 +966,21 @@ def optimize_lineup(request: LineupOptimizeRequest):
         errored = [r for r in results if r.get("error")]
         valid.sort(key=lambda x: x.get("start_score", 0), reverse=True)
 
-        bench_tiers = ["Top Reserve", "Top Reserve", "Solid Bench", "Solid Bench", "Deep Cut"]
-
+        # Assign tiers
         for i, r in enumerate(valid):
+            injury_status = r.get("injury_status", "")
+            status_lower = (injury_status or "").lower()
+
+            # Unavailable players always get Injured or Suspended tier
+            if injury_status and is_unavailable(status_lower):
+                r["recommended_start"] = False
+                r["tier"] = "Suspended" if "suspend" in status_lower else "Injured"
+                continue
+
+            score = r["start_score"]
+
             if i < 5:
                 r["recommended_start"] = True
-                score = r["start_score"]
                 if score >= 75:
                     r["tier"] = "Lock In"
                 elif score >= 65:
@@ -980,16 +991,12 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     r["tier"] = "Sit"
             else:
                 r["recommended_start"] = False
-                r["tier"] = bench_tiers[min(i - 5, len(bench_tiers) - 1)]
-        
-        # Override tier and reasons for injured players
-        for r in valid:
-            if r.get("injury_status"):
-                status_lower = r["injury_status"].lower()
-                if "out" in status_lower or "questionable" in status_lower:
-                    r["tier"] = "Injured"
-                    r["recommended_start"] = False
-                    r["reasons"] = [r["reasons"][0]] if r["reasons"] else []
+                if score >= 65:
+                    r["tier"] = "Top Reserve"
+                elif score >= 55:
+                    r["tier"] = "Solid Bench"
+                else:
+                    r["tier"] = "Deep Cut"
 
         starters = [r for r in valid if r["recommended_start"]]
         bench = [r for r in valid if not r["recommended_start"]]
