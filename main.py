@@ -923,7 +923,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     if not injury_status:
                         if rest_days is not None and 2 <= rest_days <= 14:
                             reasons.append(f"{rest_days} Days Rest — Fresh Legs")
-                       elif rest_days == 0:
+                        elif rest_days == 0:
                             reasons.append("Back-To-Back — Fatigue Risk")
 
                 # Start score — based on consistent dr_score from get_draftroom_score()
