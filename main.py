@@ -92,33 +92,40 @@ def fetch_injury_report() -> Dict[str, str]:
 
         for team in data.get("injuries", []):
             for injury in team.get("injuries", []):
-                athlete = injury.get("athlete", {})
-                full_name = athlete.get("displayName", "").lower().strip()
+                try:
+                    athlete = injury.get("athlete", {})
+                    full_name = athlete.get("displayName", "")
+                    if isinstance(full_name, dict):
+                        full_name = full_name.get("value", "")
+                    full_name = str(full_name).lower().strip()
 
-                # ESPN can return status/type as either a string or a dict
-                raw_status = injury.get("status", "")
-                if isinstance(raw_status, dict):
-                    status = raw_status.get("type", raw_status.get("name", "")).strip()
-                else:
-                    status = str(raw_status).strip()
+                    raw_status = injury.get("status", "")
+                    if isinstance(raw_status, dict):
+                        status = raw_status.get("type", raw_status.get("name", "")).strip()
+                    else:
+                        status = str(raw_status).strip()
 
-                raw_type = injury.get("type", "")
-                if isinstance(raw_type, dict):
-                    injury_type = raw_type.get("name", "").lower().strip()
-                else:
-                    injury_type = str(raw_type).lower().strip()
+                    raw_type = injury.get("type", "")
+                    if isinstance(raw_type, dict):
+                        injury_type = raw_type.get("name", "").lower().strip()
+                    else:
+                        injury_type = str(raw_type).lower().strip()
 
-                reason = injury.get("longComment", injury.get("shortComment", ""))
-                if isinstance(reason, dict):
-                    reason = reason.get("value", "")
-                reason = str(reason).strip()
+                    reason = injury.get("longComment", injury.get("shortComment", ""))
+                    if isinstance(reason, dict):
+                        reason = reason.get("value", "")
+                    reason = str(reason).strip()
 
-                if full_name and status:
-                    key = strip_accents(full_name)
-                    new_cache[key] = status
-                    new_type[key] = injury_type
-                    if reason:
-                        new_reason[key] = reason
+                    if full_name and status:
+                        key = strip_accents(full_name)
+                        new_cache[key] = status
+                        new_type[key] = injury_type
+                        if reason:
+                            new_reason[key] = reason
+
+                except Exception as field_err:
+                    print(f"Injury field error: {field_err} | keys: {list(injury.keys())} | {str(injury)[:200]}")
+                    continue
 
         _injury_cache = new_cache
         _injury_cache_reason = new_reason
