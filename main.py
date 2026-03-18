@@ -52,6 +52,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://draftroom-frontend.vercel.app",
+        "https://draftroom-co.vercel.app",  # add this
         "https://*.vercel.app",
     ],
     allow_credentials=True,
