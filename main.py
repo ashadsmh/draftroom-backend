@@ -981,6 +981,15 @@ def optimize_lineup(request: LineupOptimizeRequest):
             else:
                 r["recommended_start"] = False
                 r["tier"] = bench_tiers[min(i - 5, len(bench_tiers) - 1)]
+        
+        # Override tier and reasons for injured players
+        for r in valid:
+            if r.get("injury_status"):
+                status_lower = r["injury_status"].lower()
+                if "out" in status_lower or "questionable" in status_lower:
+                    r["tier"] = "Injured"
+                    r["recommended_start"] = False
+                    r["reasons"] = [r["reasons"][0]] if r["reasons"] else []
 
         starters = [r for r in valid if r["recommended_start"]]
         bench = [r for r in valid if not r["recommended_start"]]
