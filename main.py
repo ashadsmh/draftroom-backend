@@ -58,6 +58,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.get("/debug/injuries")
+def debug_injuries():
+    fetch_injury_report()
+    return {
+        "cache_size": len(_injury_cache),
+        "sample": dict(list(_injury_cache.items())[:10]),
+        "cache_age_seconds": time.time() - _injury_cache_time
+    }
 
 # ─── Injury / Suspension cache ────────────────────────────────────────────────
 
