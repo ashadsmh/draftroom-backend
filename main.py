@@ -58,14 +58,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.get("/debug/injuries")
-def debug_injuries():
-    fetch_injury_report()
-    return {
-        "cache_size": len(_injury_cache),
-        "sample": dict(list(_injury_cache.items())[:10]),
-        "cache_age_seconds": time.time() - _injury_cache_time
-    }
 
 # ─── Injury / Suspension cache ────────────────────────────────────────────────
 
@@ -89,14 +81,18 @@ def fetch_injury_report() -> Dict[str, str]:
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/json"
         })
+        print(f"ESPN status: {resp.status_code}")
+        print(f"ESPN response preview: {resp.text[:500]}")
+        
         if resp.status_code != 200:
             print(f"Injury fetch failed: {resp.status_code}")
             return _injury_cache
 
         data = resp.json()
-        new_cache: Dict[str, str] = {}
-        new_reason: Dict[str, str] = {}
-        new_type: Dict[str, str] = {}
+        print(f"ESPN top-level keys: {list(data.keys())}")
+        print(f"ESPN injuries count: {len(data.get('injuries', []))}")
+        
+        # ... rest unchanged
 
         for team in data.get("injuries", []):
             for injury in team.get("injuries", []):
@@ -681,6 +677,14 @@ class LineupOptimizeRequest(BaseModel):
     player_names: List[str]
     season: str = "2025-26"
 
+@app.get("/debug/injuries")
+def debug_injuries():
+    fetch_injury_report()
+    return {
+        "cache_size": len(_injury_cache),
+        "sample": dict(list(_injury_cache.items())[:10]),
+        "cache_age_seconds": round(time.time() - _injury_cache_time, 1)
+    }
 
 @app.post("/lineup/optimize", summary="Optimize fantasy lineup from a roster of player names")
 def optimize_lineup(request: LineupOptimizeRequest):
