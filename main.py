@@ -191,15 +191,8 @@ def get_position_defense_baseline(position: str) -> float:
 
 
 def compute_def_impact(stl: float, blk: float, dreb: float, position: str = "") -> float:
-    """
-    Reworked defensive formula:
-    - STL weighted 2.0x (most position-agnostic defensive stat)
-    - BLK weighted 1.2x
-    - DREB weighted 0.4x
-    - Position baseline added to compensate guards/forwards vs bigs
-    """
     baseline = get_position_defense_baseline(position)
-    return (stl * 2.0) + (blk * 1.2) + (dreb * 0.4) + baseline
+    return (stl * 2.2) + (blk * 1.4) + (dreb * 0.25) + baseline
 
 
 # ─── Nickname map ─────────────────────────────────────────────────────────────
@@ -442,7 +435,7 @@ def get_draftroom_score(player_id: int, season: str = Query("2025-26")):
 
         ts_denom = 2 * (fga + 0.44 * fta)
         ts = (pts / ts_denom) if ts_denom > 0 else 0
-        ts_rel = ts - 0.56
+        ts_rel = ts - 0.58
         play = ast - (0.5 * tov)
         def_impact = compute_def_impact(stl, blk, dreb, position)
         ftr = fta / max(fga, 1.0)
@@ -451,21 +444,23 @@ def get_draftroom_score(player_id: int, season: str = Query("2025-26")):
         def normalize(val, min_val, max_val):
             return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
 
-        ts_rel_score = normalize(ts_rel, -0.08, 0.08)
+        ts_rel_score = normalize(ts_rel, -0.07, 0.09)
         play_score = normalize(play, -1.0, 6.0)
         def_score = normalize(def_impact, 0.0, 8.0)   # expanded range for new formula
         ftr_score = normalize(ftr, 0.05, 0.45)
-        vol_eff_score = normalize(vol_eff, -0.1, 0.3)
+        vol_eff_score = normalize(vol_eff, -0.08, 0.35)
 
         # Rebalanced weights: defense up to 25%, foul draw down to 5%
+       
         raw_score = (
-            ts_rel_score  * 0.25 +
-            play_score    * 0.20 +
+            vol_eff_score * 0.30 +
             def_score     * 0.25 +
-            ftr_score     * 0.05 +
-            vol_eff_score * 0.25
+            play_score    * 0.20 +
+            ts_rel_score  * 0.15 +
+            ftr_score     * 0.10
         )
-        draftroom_score = min(99.9, 40.0 + (raw_score * 0.6))
+
+        draftroom_score = min(99.9, 38.0 + (raw_score * 0.65))
 
         return {
             "player_id": player_id,
@@ -528,20 +523,20 @@ def get_dr_history(player_id: int, games: str = Query("20"), season: str = Query
 
             ts_denom = 2 * (fga + 0.44 * fta)
             ts = (pts / ts_denom) if ts_denom > 0 else 0
-            ts_rel = ts - 0.56
+            ts_rel = ts - 0.58
             play = ast - (0.5 * tov)
             def_impact = compute_def_impact(stl, blk, dreb, position)
             ftr = fta / max(fga, 1.0)
             vol_eff = ts_rel * math.sqrt(fga)
 
             raw_score = (
-                normalize(ts_rel, -0.08, 0.08)  * 0.25 +
-                normalize(play, -1.0, 6.0)       * 0.20 +
-                normalize(def_impact, 0.0, 8.0)  * 0.25 +
-                normalize(ftr, 0.05, 0.45)       * 0.05 +
-                normalize(vol_eff, -0.1, 0.3)    * 0.25
+                normalize(vol_eff_score, -0.07, 0.09)  * 0.30 +
+                normalize(def_score, -1.0, 6.0)       * 0.25 +
+                normalize(play_score, 0.0, 8.0)  * 0.20 +
+                normalize(ts_rel_score, 0.05, 0.45)       * 0.15 +
+                normalize(ftr_score, -0.08, 0.35)    * 0.10
             )
-            draftroom_score = min(99.9, 40.0 + (raw_score * 0.6))
+            draftroom_score = min(99.9, 38.0 + (raw_score * 0.65))
             matchup = g.get("MATCHUP", "")
             opponent = matchup[-3:] if matchup else ""
 
@@ -656,20 +651,20 @@ def get_player_trajectory(player_id: int, season: str = Query("2025-26")):
 
         ts_denom = 2 * (fga_proj + 0.44 * fta_proj)
         ts = (pts_proj / ts_denom) if ts_denom > 0 else 0
-        ts_rel = ts - 0.56
+        ts_rel = ts - 0.58
         play = ast_proj - (0.5 * tov_proj)
         def_impact = compute_def_impact(stl_proj, blk_proj, dreb_proj, position)
         ftr = fta_proj / max(fga_proj, 1.0)
         vol_eff = ts_rel * math.sqrt(max(fga_proj, 0))
 
         raw_score = (
-            normalize(ts_rel, -0.08, 0.08)  * 0.25 +
-            normalize(play, -1.0, 6.0)       * 0.20 +
-            normalize(def_impact, 0.0, 8.0)  * 0.25 +
-            normalize(ftr, 0.05, 0.45)       * 0.05 +
-            normalize(vol_eff, -0.1, 0.3)    * 0.25
+            normalize(vol_eff_score, -0.07, 0.09)  * 0.30 +
+            normalize(def_score, -1.0, 6.0)       * 0.25 +
+            normalize(play_score, 0.0, 8.0)  * 0.20 +
+            normalize(ts_rel_score, 0.05, 0.45)       * 0.15 +
+            normalize(ftr_score, -0.08, 0.35)    * 0.10
         )
-        dr_proj = min(99.9, 40.0 + (raw_score * 0.6))
+        dr_proj = min(99.9, 38.0 + (raw_score * 0.65))
 
         dr_pms = []
         for i in range(n):
@@ -686,7 +681,7 @@ def get_player_trajectory(player_id: int, season: str = Query("2025-26")):
             ftr_i = fta_pms[i] * mins[i] / max(fga_pms[i] * mins[i], 1.0)
             vol_i = ts_rel_i * math.sqrt(max(fga_pms[i] * mins[i], 0))
             raw_i = (
-                normalize(ts_rel_i, -0.08, 0.08)  * 0.25 +
+                normalize(ts_rel_i, -0.07, 0.09)  * 0.25 +
                 normalize(play_i, -1.0, 6.0)       * 0.20 +
                 normalize(def_i, 0.0, 8.0)         * 0.25 +
                 normalize(ftr_i, 0.05, 0.45)       * 0.05 +
