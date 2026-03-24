@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+:root {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --bg-slate-950: #0b1220;
+  --text-slate-100: #f1f5f9;
+}
+
+body {
+  background-color: var(--bg-slate-950);
+  color: var(--text-slate-100);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Note: @apply is a Tailwind/PostCSS at-rule and must be processed by PostCSS inside a rule; it's removed here because equivalent properties are set above. */
+
+@keyframes ripple-wave {
+  0%, 100% {
+    transform: translateY(0) scale(1);
+  }
+  50% {
+    transform: translateY(-6px) scale(1.05);
+  }
+}
