@@ -56,6 +56,24 @@ POSITION_DEFENSE_BASELINE = {
     "C": 0.0
 }
 
+# DR Score weights — must be identical across all endpoints
+DR_WEIGHTS = {
+    "ts_rel":  0.25,
+    "vol_eff": 0.25,
+    "play":    0.20,
+    "defense": 0.25,
+    "ftr":     0.05,
+}
+
+# Normalization ranges
+DR_RANGES = {
+    "ts_rel":  (-0.08, 0.08),
+    "vol_eff": (-0.1, 0.3),
+    "play":    (-1.0, 6.0),
+    "defense": (0.0, 7.0),
+    "ftr":     (0.05, 0.45),
+}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -185,14 +203,63 @@ def is_questionable(status: str) -> bool:
     return any(k in status.lower() for k in ["questionable", "doubtful"])
 
 
-def get_position_defense_baseline(position: str) -> float:
-    """Return position-based defensive baseline to level the playing field."""
-    return POSITION_DEFENSE_BASELINE.get(position, 0.4)
+def normalize(val: float, min_val: float, max_val: float) -> float:
+    return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
 
 
 def compute_def_impact(stl: float, blk: float, dreb: float, position: str = "") -> float:
-    baseline = get_position_defense_baseline(position)
-    return (stl * 2.2) + (blk * 1.4) + (dreb * 0.25) + baseline
+    """
+    Defensive impact formula:
+    - STL x2.2 (most position-agnostic, rewards perimeter defenders)
+    - BLK x1.4 (rim protection, naturally rewards Wemby-type bigs)
+    - DREB x0.25 capped at 1.5 (prevents pure rebounders from dominating)
+    - Position baseline gives guards a floor to compensate for lower box score counts
+    """
+    baseline = POSITION_DEFENSE_BASELINE.get(position, 0.4)
+    dreb_contribution = min(dreb * 0.25, 1.5)
+    return (stl * 2.2) + (blk * 1.4) + dreb_contribution + baseline
+
+
+def compute_dr_score(pts: float, fga: float, fta: float, ast: float, tov: float,
+                     stl: float, blk: float, dreb: float, position: str = "") -> dict:
+    """
+    Single source of truth for DR Score computation.
+    Used by all endpoints to ensure full consistency.
+    """
+    ts_denom = 2 * (fga + 0.44 * fta)
+    ts = (pts / ts_denom) if ts_denom > 0 else 0
+    ts_rel = ts - 0.56
+    play = ast - (0.5 * tov)
+    def_impact = compute_def_impact(stl, blk, dreb, position)
+    ftr = fta / max(fga, 1.0)
+    vol_eff = ts_rel * math.sqrt(fga)
+
+    ts_rel_score  = normalize(ts_rel,    *DR_RANGES["ts_rel"])
+    vol_eff_score = normalize(vol_eff,   *DR_RANGES["vol_eff"])
+    play_score    = normalize(play,      *DR_RANGES["play"])
+    def_score     = normalize(def_impact, *DR_RANGES["defense"])
+    ftr_score     = normalize(ftr,       *DR_RANGES["ftr"])
+
+    raw_score = (
+        ts_rel_score  * DR_WEIGHTS["ts_rel"]  +
+        vol_eff_score * DR_WEIGHTS["vol_eff"] +
+        play_score    * DR_WEIGHTS["play"]    +
+        def_score     * DR_WEIGHTS["defense"] +
+        ftr_score     * DR_WEIGHTS["ftr"]
+    )
+
+    draftroom_score = min(99.9, 40.0 + (raw_score * 0.6))
+
+    return {
+        "draftroom_score": round(draftroom_score, 1),
+        "components": {
+            "ts_rel_score":  round(ts_rel_score, 1),
+            "play_score":    round(play_score, 1),
+            "def_score":     round(def_score, 1),
+            "ftr_score":     round(ftr_score, 1),
+            "vol_eff_score": round(vol_eff_score, 1),
+        }
+    }
 
 
 # ─── Nickname map ─────────────────────────────────────────────────────────────
@@ -414,7 +481,6 @@ def get_draftroom_score(player_id: int, season: str = Query("2025-26")):
         if len(games) < 5:
             raise HTTPException(status_code=422, detail="Not enough games to compute score (minimum 5).")
 
-        # Fetch position for baseline
         try:
             info = commonplayerinfo.CommonPlayerInfo(player_id=player_id, timeout=10).get_normalized_dict()
             position = info.get('CommonPlayerInfo', [{}])[0].get('POSITION', '')
@@ -424,54 +490,21 @@ def get_draftroom_score(player_id: int, season: str = Query("2025-26")):
         recent_games = games[:10]
         games_sampled = len(recent_games)
 
-        pts = sum(g.get('PTS') or 0 for g in recent_games) / games_sampled
-        fga = sum(g.get('FGA') or 0 for g in recent_games) / games_sampled
-        fta = sum(g.get('FTA') or 0 for g in recent_games) / games_sampled
-        ast = sum(g.get('AST') or 0 for g in recent_games) / games_sampled
-        tov = sum(g.get('TOV') or 0 for g in recent_games) / games_sampled
-        stl = sum(g.get('STL') or 0 for g in recent_games) / games_sampled
-        blk = sum(g.get('BLK') or 0 for g in recent_games) / games_sampled
+        pts  = sum(g.get('PTS')  or 0 for g in recent_games) / games_sampled
+        fga  = sum(g.get('FGA')  or 0 for g in recent_games) / games_sampled
+        fta  = sum(g.get('FTA')  or 0 for g in recent_games) / games_sampled
+        ast  = sum(g.get('AST')  or 0 for g in recent_games) / games_sampled
+        tov  = sum(g.get('TOV')  or 0 for g in recent_games) / games_sampled
+        stl  = sum(g.get('STL')  or 0 for g in recent_games) / games_sampled
+        blk  = sum(g.get('BLK')  or 0 for g in recent_games) / games_sampled
         dreb = sum(g.get('DREB') or 0 for g in recent_games) / games_sampled
 
-        ts_denom = 2 * (fga + 0.44 * fta)
-        ts = (pts / ts_denom) if ts_denom > 0 else 0
-        ts_rel = ts - 0.58
-        play = ast - (0.5 * tov)
-        def_impact = compute_def_impact(stl, blk, dreb, position)
-        ftr = fta / max(fga, 1.0)
-        vol_eff = ts_rel * math.sqrt(fga)
-
-        def normalize(val, min_val, max_val):
-            return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-
-        ts_rel_score = normalize(ts_rel, -0.07, 0.09)
-        play_score = normalize(play, -1.0, 6.0)
-        def_score = normalize(def_impact, 0.0, 8.0)   # expanded range for new formula
-        ftr_score = normalize(ftr, 0.05, 0.45)
-        vol_eff_score = normalize(vol_eff, -0.08, 0.35)
-
-        # Rebalanced weights: defense up to 25%, foul draw down to 5%
-       
-        raw_score = (
-            vol_eff_score * 0.30 +
-            def_score     * 0.25 +
-            play_score    * 0.20 +
-            ts_rel_score  * 0.15 +
-            ftr_score     * 0.10
-        )
-
-        draftroom_score = min(99.9, 38.0 + (raw_score * 0.65))
+        result = compute_dr_score(pts, fga, fta, ast, tov, stl, blk, dreb, position)
 
         return {
             "player_id": player_id,
-            "draftroom_score": round(draftroom_score, 1),
-            "components": {
-                "ts_rel_score": round(ts_rel_score, 1),
-                "play_score": round(play_score, 1),
-                "def_score": round(def_score, 1),
-                "ftr_score": round(ftr_score, 1),
-                "vol_eff_score": round(vol_eff_score, 1)
-            },
+            "draftroom_score": result["draftroom_score"],
+            "components": result["components"],
             "games_sampled": games_sampled,
             "season": season
         }
@@ -484,7 +517,6 @@ def get_draftroom_score(player_id: int, season: str = Query("2025-26")):
 @app.get("/players/{player_id}/dr-history")
 def get_dr_history(player_id: int, games: str = Query("20"), season: str = Query("2025-26")):
     try:
-        # Fetch position for baseline
         try:
             info = commonplayerinfo.CommonPlayerInfo(player_id=player_id, timeout=10).get_normalized_dict()
             position = info.get('CommonPlayerInfo', [{}])[0].get('POSITION', '')
@@ -507,36 +539,18 @@ def get_dr_history(player_id: int, games: str = Query("20"), season: str = Query
 
         games_list.reverse()
 
-        def normalize(val, min_val, max_val):
-            return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-
         history = []
         for i, g in enumerate(games_list):
-            pts = g.get('PTS') or 0
-            fga = g.get('FGA') or 0
-            fta = g.get('FTA') or 0
-            ast = g.get('AST') or 0
-            tov = g.get('TOV') or 0
-            stl = g.get('STL') or 0
-            blk = g.get('BLK') or 0
+            pts  = g.get('PTS')  or 0
+            fga  = g.get('FGA')  or 0
+            fta  = g.get('FTA')  or 0
+            ast  = g.get('AST')  or 0
+            tov  = g.get('TOV')  or 0
+            stl  = g.get('STL')  or 0
+            blk  = g.get('BLK')  or 0
             dreb = g.get('DREB') or 0
 
-            ts_denom = 2 * (fga + 0.44 * fta)
-            ts = (pts / ts_denom) if ts_denom > 0 else 0
-            ts_rel = ts - 0.58
-            play = ast - (0.5 * tov)
-            def_impact = compute_def_impact(stl, blk, dreb, position)
-            ftr = fta / max(fga, 1.0)
-            vol_eff = ts_rel * math.sqrt(fga)
-
-            raw_score = (
-                normalize(vol_eff_score, -0.07, 0.09)  * 0.30 +
-                normalize(def_score, -1.0, 6.0)       * 0.25 +
-                normalize(play_score, 0.0, 8.0)  * 0.20 +
-                normalize(ts_rel_score, 0.05, 0.45)       * 0.15 +
-                normalize(ftr_score, -0.08, 0.35)    * 0.10
-            )
-            draftroom_score = min(99.9, 38.0 + (raw_score * 0.65))
+            result = compute_dr_score(pts, fga, fta, ast, tov, stl, blk, dreb, position)
             matchup = g.get("MATCHUP", "")
             opponent = matchup[-3:] if matchup else ""
 
@@ -544,7 +558,7 @@ def get_dr_history(player_id: int, games: str = Query("20"), season: str = Query
                 "game_number": i + 1,
                 "date": g.get("GAME_DATE", ""),
                 "opponent": opponent,
-                "dr_score": round(draftroom_score, 1),
+                "dr_score": result["draftroom_score"],
                 "pts": float(pts),
                 "ast": float(ast),
                 "reb": float(g.get("REB") or 0)
@@ -560,7 +574,6 @@ def get_dr_history(player_id: int, games: str = Query("20"), season: str = Query
 @app.get("/players/{player_id}/trajectory")
 def get_player_trajectory(player_id: int, season: str = Query("2025-26")):
     try:
-        # Fetch position for baseline
         try:
             info = commonplayerinfo.CommonPlayerInfo(player_id=player_id, timeout=10).get_normalized_dict()
             position = info.get('CommonPlayerInfo', [{}])[0].get('POSITION', '')
@@ -636,59 +649,34 @@ def get_player_trajectory(player_id: int, season: str = Query("2025-26")):
 
             return projected, trend, confidence, x_pms
 
-        pts_proj, pts_trend, pts_conf, pts_pms = compute_projection(get_stat_array('PTS', True))
-        ast_proj, ast_trend, ast_conf, ast_pms = compute_projection(get_stat_array('AST'))
-        reb_proj, reb_trend, reb_conf, reb_pms = compute_projection(get_stat_array('REB'))
-        fga_proj, _, _, fga_pms = compute_projection(get_stat_array('FGA'))
-        fta_proj, _, _, fta_pms = compute_projection(get_stat_array('FTA'))
-        tov_proj, _, _, tov_pms = compute_projection(get_stat_array('TOV'))
-        stl_proj, _, _, stl_pms = compute_projection(get_stat_array('STL'))
-        blk_proj, _, _, blk_pms = compute_projection(get_stat_array('BLK'))
-        dreb_proj, _, _, dreb_pms = compute_projection(get_stat_array('DREB'))
+        pts_proj,  pts_trend,  pts_conf,  pts_pms  = compute_projection(get_stat_array('PTS', True))
+        ast_proj,  ast_trend,  ast_conf,  ast_pms  = compute_projection(get_stat_array('AST'))
+        reb_proj,  reb_trend,  reb_conf,  reb_pms  = compute_projection(get_stat_array('REB'))
+        fga_proj,  _,          _,         fga_pms  = compute_projection(get_stat_array('FGA'))
+        fta_proj,  _,          _,         fta_pms  = compute_projection(get_stat_array('FTA'))
+        tov_proj,  _,          _,         tov_pms  = compute_projection(get_stat_array('TOV'))
+        stl_proj,  _,          _,         stl_pms  = compute_projection(get_stat_array('STL'))
+        blk_proj,  _,          _,         blk_pms  = compute_projection(get_stat_array('BLK'))
+        dreb_proj, _,          _,         dreb_pms = compute_projection(get_stat_array('DREB'))
 
-        def normalize(val, min_val, max_val):
-            return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-
-        ts_denom = 2 * (fga_proj + 0.44 * fta_proj)
-        ts = (pts_proj / ts_denom) if ts_denom > 0 else 0
-        ts_rel = ts - 0.58
-        play = ast_proj - (0.5 * tov_proj)
-        def_impact = compute_def_impact(stl_proj, blk_proj, dreb_proj, position)
-        ftr = fta_proj / max(fga_proj, 1.0)
-        vol_eff = ts_rel * math.sqrt(max(fga_proj, 0))
-
-        raw_score = (
-            normalize(vol_eff_score, -0.07, 0.09)  * 0.30 +
-            normalize(def_score, -1.0, 6.0)       * 0.25 +
-            normalize(play_score, 0.0, 8.0)  * 0.20 +
-            normalize(ts_rel_score, 0.05, 0.45)       * 0.15 +
-            normalize(ftr_score, -0.08, 0.35)    * 0.10
+        dr_result = compute_dr_score(
+            pts_proj, fga_proj, fta_proj, ast_proj, tov_proj,
+            stl_proj, blk_proj, dreb_proj, position
         )
-        dr_proj = min(99.9, 38.0 + (raw_score * 0.65))
+        dr_proj = dr_result["draftroom_score"]
 
         dr_pms = []
         for i in range(n):
-            ts_d = 2 * (fga_pms[i] * mins[i] + 0.44 * fta_pms[i] * mins[i])
-            ts_i = (pts_pms[i] * mins[i] / ts_d) if ts_d > 0 else 0
-            ts_rel_i = ts_i - 0.56
-            play_i = ast_pms[i] * mins[i] - (0.5 * tov_pms[i] * mins[i])
-            def_i = compute_def_impact(
-                stl_pms[i] * mins[i],
-                blk_pms[i] * mins[i],
-                dreb_pms[i] * mins[i],
-                position
-            )
-            ftr_i = fta_pms[i] * mins[i] / max(fga_pms[i] * mins[i], 1.0)
-            vol_i = ts_rel_i * math.sqrt(max(fga_pms[i] * mins[i], 0))
-            raw_i = (
-                normalize(ts_rel_i, -0.07, 0.09)  * 0.25 +
-                normalize(play_i, -1.0, 6.0)       * 0.20 +
-                normalize(def_i, 0.0, 8.0)         * 0.25 +
-                normalize(ftr_i, 0.05, 0.45)       * 0.05 +
-                normalize(vol_i, -0.1, 0.3)        * 0.25
-            )
-            dr_i = min(99.9, 40.0 + (raw_i * 0.6))
-            dr_pms.append(dr_i / mins[i])
+            g_pts  = pts_pms[i]  * mins[i]
+            g_fga  = fga_pms[i]  * mins[i]
+            g_fta  = fta_pms[i]  * mins[i]
+            g_ast  = ast_pms[i]  * mins[i]
+            g_tov  = tov_pms[i]  * mins[i]
+            g_stl  = stl_pms[i]  * mins[i]
+            g_blk  = blk_pms[i]  * mins[i]
+            g_dreb = dreb_pms[i] * mins[i]
+            g_result = compute_dr_score(g_pts, g_fga, g_fta, g_ast, g_tov, g_stl, g_blk, g_dreb, position)
+            dr_pms.append(g_result["draftroom_score"] / mins[i])
 
         if n >= 10:
             avg_last3 = sum(dr_pms[-3:]) / 3 * avg_min
@@ -852,34 +840,6 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 else:
                     min_trend = "down"
 
-                def normalize(val, min_val, max_val):
-                    return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-
-                def game_dr(g, position=""):
-                    gpts = g.get('PTS') or 0
-                    gfga = g.get('FGA') or 0
-                    gfta = g.get('FTA') or 0
-                    gast = g.get('AST') or 0
-                    gtov = g.get('TOV') or 0
-                    gstl = g.get('STL') or 0
-                    gblk = g.get('BLK') or 0
-                    gdreb = g.get('DREB') or 0
-                    td = 2 * (gfga + 0.44 * gfta)
-                    gts = (gpts / td) if td > 0 else 0
-                    gts_rel = gts - 0.56
-                    gplay = gast - (0.5 * gtov)
-                    gdef = compute_def_impact(gstl, gblk, gdreb, position)
-                    gftr = gfta / max(gfga, 1.0)
-                    gvol = gts_rel * math.sqrt(gfga)
-                    r = (
-                        normalize(gts_rel, -0.08, 0.08)  * 0.25 +
-                        normalize(gplay, -1.0, 6.0)       * 0.20 +
-                        normalize(gdef, 0.0, 8.0)         * 0.25 +
-                        normalize(gftr, 0.05, 0.45)       * 0.05 +
-                        normalize(gvol, -0.1, 0.3)        * 0.25
-                    )
-                    return min(99.9, 40.0 + (r * 0.6))
-
                 try:
                     info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=10).get_normalized_dict()
                     p_info = info.get('CommonPlayerInfo', [{}])[0]
@@ -889,7 +849,19 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     position = ''
                     team_abbr = ''
 
-                game_scores = [game_dr(g, position) for g in recent]
+                game_scores = []
+                for g in recent:
+                    g_pts  = g.get('PTS')  or 0
+                    g_fga  = g.get('FGA')  or 0
+                    g_fta  = g.get('FTA')  or 0
+                    g_ast  = g.get('AST')  or 0
+                    g_tov  = g.get('TOV')  or 0
+                    g_stl  = g.get('STL')  or 0
+                    g_blk  = g.get('BLK')  or 0
+                    g_dreb = g.get('DREB') or 0
+                    g_result = compute_dr_score(g_pts, g_fga, g_fta, g_ast, g_tov, g_stl, g_blk, g_dreb, position)
+                    game_scores.append(g_result["draftroom_score"])
+
                 last3_dr = sum(game_scores[:3]) / 3
                 prev7_dr = sum(game_scores[3:]) / len(game_scores[3:]) if len(game_scores) > 3 else last3_dr
                 dr_delta = last3_dr - prev7_dr
@@ -901,10 +873,10 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 else:
                     dr_trend = "down"
 
-                pts = sum(g.get('PTS') or 0 for g in recent) / len(recent)
-                ast = sum(g.get('AST') or 0 for g in recent) / len(recent)
-                stl = sum(g.get('STL') or 0 for g in recent) / len(recent)
-                blk = sum(g.get('BLK') or 0 for g in recent) / len(recent)
+                pts  = sum(g.get('PTS')  or 0 for g in recent) / len(recent)
+                ast  = sum(g.get('AST')  or 0 for g in recent) / len(recent)
+                stl  = sum(g.get('STL')  or 0 for g in recent) / len(recent)
+                blk  = sum(g.get('BLK')  or 0 for g in recent) / len(recent)
                 dreb = sum(g.get('DREB') or 0 for g in recent) / len(recent)
                 oreb = sum(g.get('OREB') or 0 for g in recent) / len(recent)
 
@@ -943,13 +915,13 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 injury_info = get_injury_status(p['full_name'])
                 injury_status = injury_info[0] if injury_info else None
                 injury_reason = injury_info[1] if injury_info else None
-                injury_type = injury_info[2] if injury_info else ""
+                injury_type   = injury_info[2] if injury_info else ""
 
                 reasons = []
 
                 if injury_status:
-                    suspended = is_suspension(injury_status, injury_type)
-                    unavailable = is_unavailable(injury_status, injury_type)
+                    suspended    = is_suspension(injury_status, injury_type)
+                    unavailable  = is_unavailable(injury_status, injury_type)
                     questionable = is_questionable(injury_status)
 
                     if suspended:
@@ -1059,7 +1031,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
 
         for i, r in enumerate(valid):
             injury_status = r.get("injury_status", "") or ""
-            injury_type = r.get("injury_reason", "") or ""
+            injury_type   = r.get("injury_reason", "") or ""
 
             if is_unavailable(injury_status, injury_type):
                 r["recommended_start"] = False
@@ -1087,7 +1059,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
                     r["tier"] = "Deep Cut"
 
         starters = [r for r in valid if r["recommended_start"]]
-        bench = [r for r in valid if not r["recommended_start"]]
+        bench    = [r for r in valid if not r["recommended_start"]]
         starters.sort(key=lambda x: POSITION_ORDER.get(x.get("position", ""), 99))
 
         return {
