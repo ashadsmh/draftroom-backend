@@ -35,21 +35,9 @@ async def startup_event():
 
 ALL_STAR_IDS = {2544, 115, 203999, 203507, 1629029, 1628983, 1630162, 1628369, 1626164, 1641705, 1630595, 1630169, 201142, 1628384, 1628973, 1630214, 203497, 1629627, 1628464, 1641784, 1630578, 1631094, 1630581, 1629675, 1628402}
 
-AWARD_IDS = ALL_STAR_IDS | {
-    203076, 201566, 201935, 202695, 203110, 203954, 1626158, 1627783,
-    1628386, 1629028, 1629630, 1630531, 203500, 203932, 1626203,
-    1630595,  # Cade Cunningham — 2x All-Star
-}
-
 BREAKOUT_CANDIDATE_IDS = [
-    1629628,  # RJ Barrett
-    1630559,  # Alperen Sengun
-    1630596,  # Evan Mobley
-    1630538,  # Naz Reid
-    1630552,  # Jalen Johnson
-    1629641,  # Darius Garland
-    1631096,  # Jabari Smith Jr.
-    1630224,  # Patrick Williams
+    1630224, 1630578, 1631094, 1630581, 1630214, 1629628, 1628402, 1629675, 1631096, 1630559,
+    1630162, 1630169, 1629029, 1628983, 1641705, 1628369, 1626164, 203999, 203507, 115
 ]
 
 DEF_RTG = {
@@ -60,6 +48,12 @@ DEF_RTG = {
     "OKC": 111.0, "ORL": 110.8, "PHI": 113.8, "PHX": 113.7, "POR": 116.6,
     "SAC": 114.4, "SAS": 115.6, "TOR": 118.1, "UTA": 119.5, "WAS": 118.9
 }
+
+_injury_cache: dict = {}
+_injury_cache_reason: dict = {}
+_injury_cache_type: dict = {}
+_injury_cache_time: float = 0
+INJURY_CACHE_TTL = 7200
 
 # Configure CORS for the React frontend
 app.add_middleware(
@@ -169,8 +163,8 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         
         def filter_candidates(min_minutes, min_delta):
             print(f"Starting filter with {len(results)} players")
-        
-            s1 = [r for r in results if r["id"] not in AWARD_IDS]
+            
+            s1 = [r for r in results if r["id"] not in ALL_STAR_IDS]
             print(f"After ALL_STAR_IDS filter: {len(s1)} players remain")
             
             s2 = []
@@ -203,7 +197,7 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         
         if len(breakout_alerts) < 3:
             print("Fewer than 3 candidates passed relaxed filters. Using fallback.")
-            fallback_candidates = [r for r in results if r["id"] not in AWARD_IDS and r.get("avg_minutes", 0) >= 15]
+            fallback_candidates = [r for r in results if r["id"] not in ALL_STAR_IDS and r.get("avg_minutes", 0) >= 15]
             fallback_candidates = sorted(fallback_candidates, key=lambda x: x["score"], reverse=True)
             
             seen = {r["id"] for r in breakout_alerts}
@@ -564,6 +558,52 @@ def get_player_trajectory(player_id: int, season: str = Query("2025-26", descrip
         print(f"Error in get_player_trajectory for {player_id}: {e}")
         raise HTTPException(status_code=422, detail=f"Error computing trajectory: {str(e)}")
 
+def fetch_injury_report():
+    global _injury_cache, _injury_cache_reason, _injury_cache_type, _injury_cache_time
+    import requests, unicodedata
+    now = time.time()
+    if _injury_cache and (now - _injury_cache_time) < INJURY_CACHE_TTL:
+        return _injury_cache
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        if resp.status_code != 200:
+            return _injury_cache
+        data = resp.json()
+        new_cache, new_reason, new_type = {}, {}, {}
+        for team in data.get("injuries", []):
+            for injury in team.get("injuries", []):
+                try:
+                    athlete = injury.get("athlete", {})
+                    full_name = str(athlete.get("displayName", "")).lower().strip()
+                    key = ''.join(c for c in unicodedata.normalize('NFD', full_name) if unicodedata.category(c) != 'Mn')
+                    raw_status = injury.get("status", "")
+                    status = raw_status.get("type", raw_status.get("name", "")).strip() if isinstance(raw_status, dict) else str(raw_status).strip()
+                    raw_type = injury.get("type", "")
+                    injury_type = raw_type.get("name", "").lower().strip() if isinstance(raw_type, dict) else str(raw_type).lower().strip()
+                    reason = str(injury.get("longComment", injury.get("shortComment", ""))).strip()
+                    if key and status:
+                        new_cache[key] = status
+                        new_type[key] = injury_type
+                        if reason:
+                            new_reason[key] = reason
+                except Exception:
+                    continue
+        _injury_cache, _injury_cache_reason, _injury_cache_type, _injury_cache_time = new_cache, new_reason, new_type, now
+        return _injury_cache
+    except Exception as e:
+        print(f"Injury fetch error: {e}")
+        return _injury_cache
+
+def get_injury_status(full_name: str):
+    import unicodedata
+    fetch_injury_report()
+    key = ''.join(c for c in unicodedata.normalize('NFD', full_name.lower().strip()) if unicodedata.category(c) != 'Mn')
+    status = _injury_cache.get(key)
+    if status:
+        return (status, _injury_cache_reason.get(key, ""), _injury_cache_type.get(key, ""))
+    return None
+
 class LineupOptimizeRequest(BaseModel):
     player_names: List[str]
     season: str = "2025-26"
@@ -760,8 +800,34 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 
             matchup_boost = opp_rank <= 10
             
+            # Compute a start_score for ranking
+            start_score = dr_score
+            if matchup_boost:
+                start_score += 4
+            if opp_rank >= 20:
+                start_score -= 3
+            if min_trend == "up":
+                start_score += 2
+            elif min_trend == "down":
+                start_score -= 3
+
+            injury_info = get_injury_status(resolved_name)
+            injury_status = injury_info[0] if injury_info else None
+            injury_reason = injury_info[1] if injury_info else ""
+
             # Build reasoning bullets
             reasons = []
+
+            if injury_status:
+                status_lower = injury_status.lower()
+                short = injury_reason.split(";")[0].replace("Injury/Illness - ", "").strip() if injury_reason else ""
+                if any(k in status_lower for k in ["out", "inactive", "suspension", "suspended"]):
+                    reasons.insert(0, f"OUT{' — ' + short if short else ''} ⚠️")
+                    start_score -= 50
+                elif any(k in status_lower for k in ["questionable", "doubtful"]):
+                    reasons.insert(0, f"QUESTIONABLE{' — ' + short if short else ''} ⚠️")
+                    start_score -= 10
+
             if dr_score >= 75:
                 reasons.append(f"Elite DR Score of {dr_score}")
             elif dr_score >= 65:
@@ -793,17 +859,6 @@ def optimize_lineup(request: LineupOptimizeRequest):
             if stl + blk >= 2.5:
                 reasons.append(f"Defensive upside: {round(stl, 1)} STL + {round(blk, 1)} BLK")
                 
-            # Compute a start_score for ranking
-            start_score = dr_score
-            if matchup_boost:
-                start_score += 4
-            if opp_rank >= 20:
-                start_score -= 3
-            if min_trend == "up":
-                start_score += 2
-            elif min_trend == "down":
-                start_score -= 3
-                
             # Assign tier
             if start_score >= 75:
                 tier = "Lock In"
@@ -833,6 +888,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 "start_score": round(start_score, 1),
                 "tier": tier,
                 "reasons": reasons,
+                "injury_status": injury_status,
                 "stats": {
                     "pts": round(pts, 1),
                     "ast": round(ast, 1),
