@@ -35,9 +35,21 @@ async def startup_event():
 
 ALL_STAR_IDS = {2544, 115, 203999, 203507, 1629029, 1628983, 1630162, 1628369, 1626164, 1641705, 1630595, 1630169, 201142, 1628384, 1628973, 1630214, 203497, 1629627, 1628464, 1641784, 1630578, 1631094, 1630581, 1629675, 1628402}
 
+AWARD_IDS = ALL_STAR_IDS | {
+    203076, 201566, 201935, 202695, 203110, 203954, 1626158, 1627783,
+    1628386, 1629028, 1629630, 1630531, 203500, 203932, 1626203,
+    1630595,  # Cade Cunningham — 2x All-Star
+}
+
 BREAKOUT_CANDIDATE_IDS = [
-    1630224, 1630578, 1631094, 1630581, 1630214, 1629628, 1628402, 1629675, 1631096, 1630559,
-    1630162, 1630169, 1629029, 1628983, 1641705, 1628369, 1626164, 203999, 203507, 115
+    1629628,  # RJ Barrett
+    1630559,  # Alperen Sengun
+    1630596,  # Evan Mobley
+    1630538,  # Naz Reid
+    1630552,  # Jalen Johnson
+    1629641,  # Darius Garland
+    1631096,  # Jabari Smith Jr.
+    1630224,  # Patrick Williams
 ]
 
 DEF_RTG = {
@@ -156,39 +168,51 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         top_prospects = sorted(main_results, key=lambda x: x["score"], reverse=True)[:6]
         
         def filter_candidates(min_minutes, min_delta):
-            candidates = []
-            for r in results:
-                pid = r["id"]
-                
-                if pid in ALL_STAR_IDS:
-                    continue
-                    
-                pts = r["stats"]["pts"]
-                delta = r["delta"]
-                avg_minutes = r.get("avg_minutes", 0)
-                
-                static_info = player_dict.get(pid, {})
+            print(f"Starting filter with {len(results)} players")
+        
+            s1 = [r for r in results if r["id"] not in AWARD_IDS]
+            print(f"After ALL_STAR_IDS filter: {len(s1)} players remain")
+            
+            s2 = []
+            for r in s1:
+                static_info = player_dict.get(r["id"], {})
                 career_games = static_info.get("career_games")
-                if career_games is not None and career_games >= 400:
-                    continue
-                    
-                if pts >= 20:
-                    continue
-                    
-                if avg_minutes < min_minutes:
-                    continue
-                    
-                if delta <= min_delta:
-                    continue
-                    
-                candidates.append(r)
-            return candidates
+                if career_games is None or career_games < 400:
+                    s2.append(r)
+            print(f"After career_games < 400 filter: {len(s2)} players remain")
             
-        breakout_candidates = filter_candidates(20, 0)
-        if not breakout_candidates:
-            breakout_candidates = filter_candidates(15, -1)
+            s3 = [r for r in s2 if r["stats"]["pts"] < 28]
+            print(f"After pts < 28 filter: {len(s3)} players remain")
             
-        breakout_alerts = sorted(breakout_candidates, key=lambda x: x["delta"], reverse=True)[:3]
+            s4 = [r for r in s3 if r.get("avg_minutes", 0) >= min_minutes]
+            print(f"After avg_minutes >= {min_minutes} filter: {len(s4)} players remain")
+            
+            s5 = [r for r in s4 if r["delta"] >= min_delta]
+            print(f"After delta >= {min_delta} filter: {len(s5)} players remain")
+            
+            return s5
+            
+        breakout_candidates = filter_candidates(18, -2)
+        
+        def breakout_score(r):
+            trend = r.get("trend", "stable")
+            bonus = 2.0 if trend == "up" else (0.0 if trend == "stable" else -1.0)
+            return r["delta"] + bonus
+            
+        breakout_alerts = sorted(breakout_candidates, key=breakout_score, reverse=True)[:3]
+        
+        if len(breakout_alerts) < 3:
+            print("Fewer than 3 candidates passed relaxed filters. Using fallback.")
+            fallback_candidates = [r for r in results if r["id"] not in AWARD_IDS and r.get("avg_minutes", 0) >= 15]
+            fallback_candidates = sorted(fallback_candidates, key=lambda x: x["score"], reverse=True)
+            
+            seen = {r["id"] for r in breakout_alerts}
+            for r in fallback_candidates:
+                if r["id"] not in seen:
+                    breakout_alerts.append(r)
+                    seen.add(r["id"])
+                if len(breakout_alerts) >= 3:
+                    break
         
         combined = {r["id"]: r for r in top_prospects + breakout_alerts}.values()
         
@@ -215,7 +239,7 @@ def get_player_gamelog(player_id: int, season: str = Query("2025-26", descriptio
         return gamelog.get_normalized_dict()
     except Exception as e:
         print(f"Error in get_player_gamelog for {player_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching game logs: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Error fetching game logs: {str(e)}")
 
 @app.get("/players/{player_id}/draftroom-score", summary="Compute DraftRoom efficiency score")
 def get_draftroom_score(player_id: int, season: str = Query("2025-26", description="NBA Season format YYYY-YY")):
@@ -294,7 +318,7 @@ def get_draftroom_score(player_id: int, season: str = Query("2025-26", descripti
         raise
     except Exception as e:
         print(f"Error in get_draftroom_score for {player_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error computing DraftRoom score: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Error computing DraftRoom score: {str(e)}")
 
 @app.get("/players/{player_id}/dr-history", summary="Get per-game DR Score history")
 def get_dr_history(player_id: int, games: str = Query("20", description="Number of games: 10, 20, 40, or season"), season: str = Query("2025-26")):
@@ -372,7 +396,7 @@ def get_dr_history(player_id: int, games: str = Query("20", description="Number 
         raise
     except Exception as e:
         print(f"Error in get_dr_history for {player_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error computing DR history: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Error computing DR history: {str(e)}")
 
 @app.get("/players/{player_id}/trajectory", summary="Get 5-game projection")
 def get_player_trajectory(player_id: int, season: str = Query("2025-26", description="NBA Season format YYYY-YY")):
@@ -538,7 +562,7 @@ def get_player_trajectory(player_id: int, season: str = Query("2025-26", descrip
         raise
     except Exception as e:
         print(f"Error in get_player_trajectory for {player_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error computing trajectory: {str(e)}")
+        raise HTTPException(status_code=422, detail=f"Error computing trajectory: {str(e)}")
 
 class LineupOptimizeRequest(BaseModel):
     player_names: List[str]
