@@ -1,5 +1,9 @@
 import math
 import time
+import logging
+import asyncio
+import requests
+import unicodedata
 from typing import List
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,6 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import commonplayerinfo, playergamelog
 from nba_api.library.http import NBAHTTP
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+CURRENT_SEASON = "2025-26"
+
+ALL_PLAYERS = players.get_players()
+PLAYER_DICT = {p['id']: p for p in ALL_PLAYERS}
 
 NBAHTTP.headers = {
     "Host": "stats.nba.com",
@@ -30,7 +42,6 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup_event():
-    import asyncio
     asyncio.get_event_loop().run_in_executor(None, get_batch_scores)
 
 ALL_STAR_IDS = {2544, 115, 203999, 203507, 1629029, 1628983, 1630162, 1628369, 1626164, 1641705, 1630595, 1630169, 201142, 1628384, 1628973, 1630214, 203497, 1629627, 1628464, 1641784, 1630578, 1631094, 1630581, 1629675, 1628402}
@@ -48,6 +59,194 @@ DEF_RTG = {
     "OKC": 111.0, "ORL": 110.8, "PHI": 113.8, "PHX": 113.7, "POR": 116.6,
     "SAC": 114.4, "SAS": 115.6, "TOR": 118.1, "UTA": 119.5, "WAS": 118.9
 }
+
+def normalize(val: float, min_val: float, max_val: float) -> float:
+    return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
+
+def parse_min(m: str | int | float) -> float:
+    if isinstance(m, str) and ':' in m:
+        pts = m.split(':')
+        return float(pts[0]) + float(pts[1])/60.0
+    elif m is not None:
+        return float(m)
+    return 1.0
+
+def calculate_dr_score(pts: float, fga: float, fta: float, ast: float, tov: float, stl: float, blk: float, dreb: float) -> tuple[float, dict]:
+    ts_denom = 2 * (fga + 0.44 * fta)
+    ts = (pts / ts_denom) if ts_denom > 0 else 0
+    ts_rel = ts - 0.56
+    
+    play = ast - (0.5 * tov)
+    def_impact = stl + (0.7 * blk) + (0.3 * dreb)
+    ftr = fta / max(fga, 1.0)
+    vol_eff = ts_rel * math.sqrt(max(fga, 0))
+    
+    ts_rel_score = normalize(ts_rel, -0.08, 0.08)
+    play_score = normalize(play, -1.0, 6.0)
+    def_score = normalize(def_impact, 0.0, 4.5)
+    ftr_score = normalize(ftr, 0.05, 0.45)
+    vol_eff_score = normalize(vol_eff, -0.1, 0.3)
+    
+    raw_score = (
+        ts_rel_score * 0.25 +
+        play_score * 0.20 +
+        def_score * 0.20 +
+        ftr_score * 0.10 +
+        vol_eff_score * 0.25
+    )
+    
+    draftroom_score = min(99.9, 40.0 + (raw_score * 0.6))
+    return draftroom_score, {
+        "ts_rel_score": round(ts_rel_score, 1),
+        "play_score": round(play_score, 1),
+        "def_score": round(def_score, 1),
+        "ftr_score": round(ftr_score, 1),
+        "vol_eff_score": round(vol_eff_score, 1)
+    }
+
+def _compute_draftroom_score(player_id: int, season: str, games: list) -> dict:
+    if len(games) < 5:
+        raise ValueError("Not enough games to compute score (minimum 5).")
+        
+    recent_games = games[:10]
+    games_sampled = len(recent_games)
+    
+    pts = sum(g.get('PTS') or 0 for g in recent_games) / games_sampled
+    fga = sum(g.get('FGA') or 0 for g in recent_games) / games_sampled
+    fta = sum(g.get('FTA') or 0 for g in recent_games) / games_sampled
+    ast = sum(g.get('AST') or 0 for g in recent_games) / games_sampled
+    tov = sum(g.get('TOV') or 0 for g in recent_games) / games_sampled
+    stl = sum(g.get('STL') or 0 for g in recent_games) / games_sampled
+    blk = sum(g.get('BLK') or 0 for g in recent_games) / games_sampled
+    dreb = sum(g.get('DREB') or 0 for g in recent_games) / games_sampled
+    
+    draftroom_score, components = calculate_dr_score(pts, fga, fta, ast, tov, stl, blk, dreb)
+    
+    return {
+        "player_id": player_id,
+        "draftroom_score": round(draftroom_score, 1),
+        "components": components,
+        "games_sampled": games_sampled,
+        "season": season
+    }
+
+def get_stat_array(recent_games: list, stat_name: str, is_pts: bool = False) -> list:
+    arr = []
+    for i, g in enumerate(recent_games):
+        val = g.get(stat_name) or 0
+        if is_pts:
+            matchup = g.get('MATCHUP', '')
+            opp = matchup[-3:] if matchup else ''
+            opp_def = DEF_RTG.get(opp, 113.0)
+            adj = opp_def / 113.0
+            val = val / adj if adj > 0 else val
+        arr.append(val)
+    return arr
+
+def compute_projection(stat_arr: list, mins: list, avg_min: float, n: int) -> tuple[float, str, float, list]:
+    x_pms = [stat_arr[i] / mins[i] for i in range(n)]
+    num = 0
+    den = 0
+    for i in range(n):
+        w_i = 0.85 ** (n - 1 - i)
+        num += w_i * x_pms[i]
+        den += w_i
+    x_hat = num / den if den > 0 else 0
+    projected = x_hat * avg_min
+    
+    if n >= 10:
+        avg_last3 = sum(x_pms[-3:]) / 3 * avg_min
+        avg_prev7 = sum(x_pms[:-3]) / 7 * avg_min
+    else:
+        avg_last3 = sum(x_pms[-3:]) / len(x_pms[-3:]) * avg_min
+        avg_prev7 = sum(x_pms[:-3]) / len(x_pms[:-3]) * avg_min if len(x_pms[:-3]) > 0 else avg_last3
+        
+    overall_avg = sum(x_pms) / n * avg_min
+    delta = avg_last3 - avg_prev7
+    
+    if abs(delta) < 0.05 * overall_avg:
+        trend = "stable"
+    elif delta > 0:
+        trend = "up"
+    else:
+        trend = "down"
+        
+    mean_pm = sum(x_pms) / n
+    if mean_pm > 0:
+        var = sum((x - mean_pm)**2 for x in x_pms) / n
+        std = math.sqrt(var)
+        cv = std / mean_pm
+    else:
+        cv = 0
+    confidence = max(20.0, min(95.0, 100.0 - 120.0 * cv))
+    
+    return projected, trend, confidence, x_pms
+
+def _compute_player_trajectory(player_id: int, season: str, games: list) -> dict:
+    if len(games) < 5:
+        raise ValueError("Not enough games for trajectory.")
+        
+    recent_games = games[:10]
+    recent_games.reverse()
+    n = len(recent_games)
+    
+    mins = [max(parse_min(g.get('MIN', 1)), 1.0) for g in recent_games]
+    avg_min = sum(mins) / n
+    
+    pts_proj, pts_trend, pts_conf, pts_pms = compute_projection(get_stat_array(recent_games, 'PTS', True), mins, avg_min, n)
+    ast_proj, ast_trend, ast_conf, ast_pms = compute_projection(get_stat_array(recent_games, 'AST'), mins, avg_min, n)
+    reb_proj, reb_trend, reb_conf, reb_pms = compute_projection(get_stat_array(recent_games, 'REB'), mins, avg_min, n)
+    
+    fga_proj, _, _, fga_pms = compute_projection(get_stat_array(recent_games, 'FGA'), mins, avg_min, n)
+    fta_proj, _, _, fta_pms = compute_projection(get_stat_array(recent_games, 'FTA'), mins, avg_min, n)
+    tov_proj, _, _, tov_pms = compute_projection(get_stat_array(recent_games, 'TOV'), mins, avg_min, n)
+    stl_proj, _, _, stl_pms = compute_projection(get_stat_array(recent_games, 'STL'), mins, avg_min, n)
+    blk_proj, _, _, blk_pms = compute_projection(get_stat_array(recent_games, 'BLK'), mins, avg_min, n)
+    dreb_proj, _, _, dreb_pms = compute_projection(get_stat_array(recent_games, 'DREB'), mins, avg_min, n)
+    
+    dr_proj, _ = calculate_dr_score(pts_proj, fga_proj, fta_proj, ast_proj, tov_proj, stl_proj, blk_proj, dreb_proj)
+    
+    dr_pms = []
+    for i in range(n):
+        dr_i, _ = calculate_dr_score(
+            pts_pms[i]*mins[i], fga_pms[i]*mins[i], fta_pms[i]*mins[i],
+            ast_pms[i]*mins[i], tov_pms[i]*mins[i], stl_pms[i]*mins[i],
+            blk_pms[i]*mins[i], dreb_pms[i]*mins[i]
+        )
+        dr_pms.append(dr_i / mins[i])
+        
+    if n >= 10:
+        avg_last3 = sum(dr_pms[-3:]) / 3 * avg_min
+        avg_prev7 = sum(dr_pms[:-3]) / 7 * avg_min
+    else:
+        avg_last3 = sum(dr_pms[-3:]) / len(dr_pms[-3:]) * avg_min
+        avg_prev7 = sum(dr_pms[:-3]) / len(dr_pms[:-3]) * avg_min if len(dr_pms[:-3]) > 0 else avg_last3
+        
+    overall_avg = sum(dr_pms) / n * avg_min
+    delta = avg_last3 - avg_prev7
+    if abs(delta) < 0.08 * overall_avg:
+        dr_trend = "stable"
+    elif delta > 0:
+        dr_trend = "up"
+    else:
+        dr_trend = "down"
+        
+    mean_pm = sum(dr_pms) / n
+    if mean_pm > 0:
+        var = sum((x - mean_pm)**2 for x in dr_pms) / n
+        std = math.sqrt(var)
+        cv = std / mean_pm
+    else:
+        cv = 0
+    dr_conf = max(20.0, min(95.0, 100.0 - 120.0 * cv))
+    
+    return {
+        "PTS": {"value": round(pts_proj, 1), "trend": pts_trend, "confidence": round(pts_conf, 1)},
+        "AST": {"value": round(ast_proj, 1), "trend": ast_trend, "confidence": round(ast_conf, 1)},
+        "REB": {"value": round(reb_proj, 1), "trend": reb_trend, "confidence": round(reb_conf, 1)},
+        "DraftRoomScore": {"value": round(dr_proj, 1), "trend": dr_trend, "confidence": round(dr_conf, 1)},
+        "avg_minutes": round(avg_min, 1)
+    }
 
 _injury_cache: dict = {}
 _injury_cache_reason: dict = {}
@@ -69,22 +268,21 @@ app.add_middleware(
 )
 
 @app.get("/players/search", summary="Search for NBA players by name")
-def search_players(query: str = Query(..., min_length=1, description="Player name search query")):
+def search_players(query: str = Query(..., min_length=1, description="Player name search query")) -> dict:
     """
     Searches the static nba_api player dictionary.
     Returns up to 20 matching players, prioritizing active players.
     """
     try:
-        all_players = players.get_players()
         # Case-insensitive search
-        matched = [p for p in all_players if query.lower() in p['full_name'].lower()]
+        matched = [p for p in ALL_PLAYERS if query.lower() in p['full_name'].lower()]
         
         # Sort active players to the top
         matched.sort(key=lambda x: not x.get('is_active', False))
         
         return {"data": matched[:20]}
     except Exception as e:
-        print(f"Error in search_players: {e}")
+        logger.error(f"Error in search_players: {e}")
         raise HTTPException(status_code=500, detail=f"Error searching players: {str(e)}")
 
 _batch_cache: dict = {}
@@ -92,7 +290,7 @@ _batch_cache_time: float = 0
 BATCH_CACHE_TTL = 7200  # 2 hours
 
 @app.get("/players/batch-scores", summary="Get batch scores for multiple players")
-def get_batch_scores(player_ids: str = Query(None, description="Comma-separated player IDs"), season: str = Query("2025-26")):
+def get_batch_scores(player_ids: str = Query(None, description="Comma-separated player IDs"), season: str = Query(CURRENT_SEASON)) -> dict:
     global _batch_cache, _batch_cache_time
     now = time.time()
     if _batch_cache and (now - _batch_cache_time) < BATCH_CACHE_TTL:
@@ -100,12 +298,9 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
 
     try:
         main_pool = [2544, 115, 203999, 203507, 1629029, 1628983, 1630162, 1628369, 1626164, 1641705, 1630595, 1630169]
-        breakout_pool = BREAKOUT_CANDIDATE_IDS[:20]
+        breakout_pool = BREAKOUT_CANDIDATE_IDS
         
         eval_pool = list(set(main_pool + breakout_pool))
-        
-        all_players = players.get_players()
-        player_dict = {p['id']: p for p in all_players}
         
         def fetch_data(pid):
             def _do_fetch():
@@ -114,12 +309,19 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
                 headline = info.get('PlayerHeadlineStats', [{}])[0]
                 
                 try:
-                    dr_res = get_draftroom_score(player_id=pid, season=season)
+                    gamelog = playergamelog.PlayerGameLog(player_id=pid, season=season, timeout=10)
+                    data = gamelog.get_normalized_dict()
+                    games = data.get("PlayerGameLog", [])
+                except Exception:
+                    games = []
+                
+                try:
+                    dr_res = _compute_draftroom_score(player_id=pid, season=season, games=games)
                 except Exception:
                     dr_res = None
                     
                 try:
-                    traj_res = get_player_trajectory(player_id=pid, season=season)
+                    traj_res = _compute_player_trajectory(player_id=pid, season=season, games=games)
                 except Exception:
                     traj_res = None
                     
@@ -147,7 +349,7 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
                 with ThreadPoolExecutor(max_workers=1) as ex:
                     return ex.submit(_do_fetch).result(timeout=8)
             except Exception as e:
-                print(f"Error fetching {pid}: {e}")
+                logger.error(f"Error fetching {pid}: {e}")
                 return None
                 
         results = []
@@ -162,27 +364,27 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         top_prospects = sorted(main_results, key=lambda x: x["score"], reverse=True)[:6]
         
         def filter_candidates(min_minutes, min_delta):
-            print(f"Starting filter with {len(results)} players")
+            logger.info(f"Starting filter with {len(results)} players")
             
             s1 = [r for r in results if r["id"] not in ALL_STAR_IDS]
-            print(f"After ALL_STAR_IDS filter: {len(s1)} players remain")
+            logger.info(f"After ALL_STAR_IDS filter: {len(s1)} players remain")
             
             s2 = []
             for r in s1:
-                static_info = player_dict.get(r["id"], {})
+                static_info = PLAYER_DICT.get(r["id"], {})
                 career_games = static_info.get("career_games")
                 if career_games is None or career_games < 400:
                     s2.append(r)
-            print(f"After career_games < 400 filter: {len(s2)} players remain")
+            logger.info(f"After career_games < 400 filter: {len(s2)} players remain")
             
             s3 = [r for r in s2 if r["stats"]["pts"] < 28]
-            print(f"After pts < 28 filter: {len(s3)} players remain")
+            logger.info(f"After pts < 28 filter: {len(s3)} players remain")
             
             s4 = [r for r in s3 if r.get("avg_minutes", 0) >= min_minutes]
-            print(f"After avg_minutes >= {min_minutes} filter: {len(s4)} players remain")
+            logger.info(f"After avg_minutes >= {min_minutes} filter: {len(s4)} players remain")
             
             s5 = [r for r in s4 if r["delta"] >= min_delta]
-            print(f"After delta >= {min_delta} filter: {len(s5)} players remain")
+            logger.info(f"After delta >= {min_delta} filter: {len(s5)} players remain")
             
             return s5
             
@@ -196,7 +398,7 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         breakout_alerts = sorted(breakout_candidates, key=breakout_score, reverse=True)[:3]
         
         if len(breakout_alerts) < 3:
-            print("Fewer than 3 candidates passed relaxed filters. Using fallback.")
+            logger.warning("Fewer than 3 candidates passed relaxed filters. Using fallback.")
             fallback_candidates = [r for r in results if r["id"] not in ALL_STAR_IDS and r.get("avg_minutes", 0) >= 15]
             fallback_candidates = sorted(fallback_candidates, key=lambda x: x["score"], reverse=True)
             
@@ -219,11 +421,11 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         _batch_cache_time = now
         return result
     except Exception as e:
-        print(f"Error in get_batch_scores: {e}")
+        logger.error(f"Error in get_batch_scores: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching batch scores: {str(e)}")
 
 @app.get("/players/{player_id}/gamelog", summary="Get recent game logs for a player")
-def get_player_gamelog(player_id: int, season: str = Query("2025-26", description="NBA Season format YYYY-YY")):
+def get_player_gamelog(player_id: int, season: str = Query(CURRENT_SEASON, description="NBA Season format YYYY-YY")) -> dict:
     """
     Fetches game-by-game logs for the specified season.
     Defaults to the 2025-26 NBA season. Includes rich stats like PTS, AST, REB, FG%, STL, BLK, plus advanced metrics if available.
@@ -232,11 +434,11 @@ def get_player_gamelog(player_id: int, season: str = Query("2025-26", descriptio
         gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=10)
         return gamelog.get_normalized_dict()
     except Exception as e:
-        print(f"Error in get_player_gamelog for {player_id}: {e}")
+        logger.error(f"Error in get_player_gamelog for {player_id}: {e}")
         raise HTTPException(status_code=422, detail=f"Error fetching game logs: {str(e)}")
 
 @app.get("/players/{player_id}/draftroom-score", summary="Compute DraftRoom efficiency score")
-def get_draftroom_score(player_id: int, season: str = Query("2025-26", description="NBA Season format YYYY-YY")):
+def get_draftroom_score(player_id: int, season: str = Query(CURRENT_SEASON, description="NBA Season format YYYY-YY")) -> dict:
     """
     Computes a weighted efficiency score from 0-100 based on the last 10 games.
     """
@@ -261,61 +463,25 @@ def get_draftroom_score(player_id: int, season: str = Query("2025-26", descripti
         blk = sum(g.get('BLK') or 0 for g in recent_games) / games_sampled
         dreb = sum(g.get('DREB') or 0 for g in recent_games) / games_sampled
         
-        # Compute components
-        ts_denom = 2 * (fga + 0.44 * fta)
-        ts = (pts / ts_denom) if ts_denom > 0 else 0
-        ts_rel = ts - 0.56
-        
-        play = ast - (0.5 * tov)
-        def_impact = stl + (0.7 * blk) + (0.3 * dreb)
-        ftr = fta / max(fga, 1.0)
-        vol_eff = ts_rel * math.sqrt(fga)
-        
-        # Normalize to 0-100 using tighter NBA reference ranges
-        def normalize(val, min_val, max_val):
-            return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-            
-        # Tighter reference ranges to spread the distribution
-        ts_rel_score = normalize(ts_rel, -0.08, 0.08)
-        play_score = normalize(play, -1.0, 6.0)
-        def_score = normalize(def_impact, 0.0, 4.5)
-        ftr_score = normalize(ftr, 0.05, 0.45)
-        vol_eff_score = normalize(vol_eff, -0.1, 0.3)
-        
-        # Weight and sum (Raw score 0-100)
-        raw_score = (
-            ts_rel_score * 0.25 +
-            play_score * 0.20 +
-            def_score * 0.20 +
-            ftr_score * 0.10 +
-            vol_eff_score * 0.25
-        )
-        
-        # Scale to NBA talent tiers (40 floor, 99 ceiling)
-        # 40 + (raw * 0.6) maps 0->40, 50->70, 100->100
-        draftroom_score = min(99.9, 40.0 + (raw_score * 0.6))
+        draftroom_score, components = calculate_dr_score(pts, fga, fta, ast, tov, stl, blk, dreb)
         
         return {
             "player_id": player_id,
             "draftroom_score": round(draftroom_score, 1),
-            "components": {
-                "ts_rel_score": round(ts_rel_score, 1),
-                "play_score": round(play_score, 1),
-                "def_score": round(def_score, 1),
-                "ftr_score": round(ftr_score, 1),
-                "vol_eff_score": round(vol_eff_score, 1)
-            },
+            "components": components,
             "games_sampled": games_sampled,
             "season": season
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        print(f"Error in get_draftroom_score for {player_id}: {e}")
+        logger.error(f"Error in get_draftroom_score for {player_id}: {e}")
         raise HTTPException(status_code=422, detail=f"Error computing DraftRoom score: {str(e)}")
 
 @app.get("/players/{player_id}/dr-history", summary="Get per-game DR Score history")
-def get_dr_history(player_id: int, games: str = Query("20", description="Number of games: 10, 20, 40, or season"), season: str = Query("2025-26")):
+def get_dr_history(player_id: int, games: str = Query("20", description="Number of games: 10, 20, 40, or season"), season: str = Query(CURRENT_SEASON)) -> dict:
     try:
         gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=10)
         data = gamelog.get_normalized_dict()
@@ -333,9 +499,6 @@ def get_dr_history(player_id: int, games: str = Query("20", description="Number 
                 
         games_list.reverse()
         
-        def normalize(val, min_val, max_val):
-            return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-            
         history = []
         for i, g in enumerate(games_list):
             pts = g.get('PTS') or 0
@@ -347,30 +510,7 @@ def get_dr_history(player_id: int, games: str = Query("20", description="Number 
             blk = g.get('BLK') or 0
             dreb = g.get('DREB') or 0
             
-            ts_denom = 2 * (fga + 0.44 * fta)
-            ts = (pts / ts_denom) if ts_denom > 0 else 0
-            ts_rel = ts - 0.56
-            
-            play = ast - (0.5 * tov)
-            def_impact = stl + (0.7 * blk) + (0.3 * dreb)
-            ftr = fta / max(fga, 1.0)
-            vol_eff = ts_rel * math.sqrt(fga)
-            
-            ts_rel_score = normalize(ts_rel, -0.08, 0.08)
-            play_score = normalize(play, -1.0, 6.0)
-            def_score = normalize(def_impact, 0.0, 4.5)
-            ftr_score = normalize(ftr, 0.05, 0.45)
-            vol_eff_score = normalize(vol_eff, -0.1, 0.3)
-            
-            raw_score = (
-                ts_rel_score * 0.25 +
-                play_score * 0.20 +
-                def_score * 0.20 +
-                ftr_score * 0.10 +
-                vol_eff_score * 0.25
-            )
-            
-            draftroom_score = min(99.9, 40.0 + (raw_score * 0.6))
+            draftroom_score, _ = calculate_dr_score(pts, fga, fta, ast, tov, stl, blk, dreb)
             
             matchup = g.get("MATCHUP", "")
             opponent = matchup[-3:] if matchup else ""
@@ -389,178 +529,27 @@ def get_dr_history(player_id: int, games: str = Query("20", description="Number 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in get_dr_history for {player_id}: {e}")
+        logger.error(f"Error in get_dr_history for {player_id}: {e}")
         raise HTTPException(status_code=422, detail=f"Error computing DR history: {str(e)}")
 
 @app.get("/players/{player_id}/trajectory", summary="Get 5-game projection")
-def get_player_trajectory(player_id: int, season: str = Query("2025-26", description="NBA Season format YYYY-YY")):
+def get_player_trajectory(player_id: int, season: str = Query(CURRENT_SEASON, description="NBA Season format YYYY-YY")) -> dict:
     try:
         gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=10)
         data = gamelog.get_normalized_dict()
         games = data.get("PlayerGameLog", [])
         
-        if len(games) < 5:
-            raise HTTPException(status_code=422, detail="Not enough games for trajectory.")
-            
-        recent_games = games[:10]
-        recent_games.reverse() # oldest to newest
-        n = len(recent_games)
-        
-        def parse_min(m):
-            if isinstance(m, str) and ':' in m:
-                pts = m.split(':')
-                return float(pts[0]) + float(pts[1])/60.0
-            elif m is not None:
-                return float(m)
-            return 1.0
-            
-        mins = [max(parse_min(g.get('MIN', 1)), 1.0) for g in recent_games]
-        avg_min = sum(mins) / n
-        
-        def get_stat_array(stat_name, is_pts=False):
-            arr = []
-            for i, g in enumerate(recent_games):
-                val = g.get(stat_name) or 0
-                if is_pts:
-                    matchup = g.get('MATCHUP', '')
-                    opp = matchup[-3:] if matchup else ''
-                    opp_def = DEF_RTG.get(opp, 113.0)
-                    adj = opp_def / 113.0
-                    val = val / adj if adj > 0 else val
-                arr.append(val)
-            return arr
-            
-        def compute_projection(stat_arr):
-            x_pms = [stat_arr[i] / mins[i] for i in range(n)]
-            num = 0
-            den = 0
-            for i in range(n):
-                w_i = 0.85 ** (n - 1 - i)
-                num += w_i * x_pms[i]
-                den += w_i
-            x_hat = num / den if den > 0 else 0
-            projected = x_hat * avg_min
-            
-            if n >= 10:
-                avg_last3 = sum(x_pms[-3:]) / 3 * avg_min
-                avg_prev7 = sum(x_pms[:-3]) / 7 * avg_min
-            else:
-                avg_last3 = sum(x_pms[-3:]) / len(x_pms[-3:]) * avg_min
-                avg_prev7 = sum(x_pms[:-3]) / len(x_pms[:-3]) * avg_min if len(x_pms[:-3]) > 0 else avg_last3
-                
-            overall_avg = sum(x_pms) / n * avg_min
-            delta = avg_last3 - avg_prev7
-            
-            if abs(delta) < 0.05 * overall_avg:
-                trend = "stable"
-            elif delta > 0:
-                trend = "up"
-            else:
-                trend = "down"
-                
-            mean_pm = sum(x_pms) / n
-            if mean_pm > 0:
-                var = sum((x - mean_pm)**2 for x in x_pms) / n
-                std = math.sqrt(var)
-                cv = std / mean_pm
-            else:
-                cv = 0
-            confidence = max(20.0, min(95.0, 100.0 - 120.0 * cv))
-            
-            return projected, trend, confidence, x_pms
-            
-        pts_proj, pts_trend, pts_conf, pts_pms = compute_projection(get_stat_array('PTS', True))
-        ast_proj, ast_trend, ast_conf, ast_pms = compute_projection(get_stat_array('AST'))
-        reb_proj, reb_trend, reb_conf, reb_pms = compute_projection(get_stat_array('REB'))
-        
-        fga_proj, _, _, fga_pms = compute_projection(get_stat_array('FGA'))
-        fta_proj, _, _, fta_pms = compute_projection(get_stat_array('FTA'))
-        tov_proj, _, _, tov_pms = compute_projection(get_stat_array('TOV'))
-        stl_proj, _, _, stl_pms = compute_projection(get_stat_array('STL'))
-        blk_proj, _, _, blk_pms = compute_projection(get_stat_array('BLK'))
-        dreb_proj, _, _, dreb_pms = compute_projection(get_stat_array('DREB'))
-        
-        ts_denom = 2 * (fga_proj + 0.44 * fta_proj)
-        ts = (pts_proj / ts_denom) if ts_denom > 0 else 0
-        ts_rel = ts - 0.56
-        play = ast_proj - (0.5 * tov_proj)
-        def_impact = stl_proj + (0.7 * blk_proj) + (0.3 * dreb_proj)
-        ftr = fta_proj / max(fga_proj, 1.0)
-        vol_eff = ts_rel * math.sqrt(max(fga_proj, 0))
-        
-        def normalize(val, min_val, max_val):
-            return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-            
-        ts_rel_score = normalize(ts_rel, -0.08, 0.08)
-        play_score = normalize(play, -1.0, 6.0)
-        def_score = normalize(def_impact, 0.0, 4.5)
-        ftr_score = normalize(ftr, 0.05, 0.45)
-        vol_eff_score = normalize(vol_eff, -0.1, 0.3)
-        
-        raw_score = (ts_rel_score * 0.25 + play_score * 0.20 + def_score * 0.20 + ftr_score * 0.10 + vol_eff_score * 0.25)
-        dr_proj = min(99.9, 40.0 + (raw_score * 0.6))
-        
-        dr_pms = []
-        for i in range(n):
-            ts_d = 2 * (fga_pms[i]*mins[i] + 0.44 * fta_pms[i]*mins[i])
-            ts_i = (pts_pms[i]*mins[i] / ts_d) if ts_d > 0 else 0
-            ts_rel_i = ts_i - 0.56
-            play_i = ast_pms[i]*mins[i] - (0.5 * tov_pms[i]*mins[i])
-            def_i = stl_pms[i]*mins[i] + (0.7 * blk_pms[i]*mins[i]) + (0.3 * dreb_pms[i]*mins[i])
-            ftr_i = fta_pms[i]*mins[i] / max(fga_pms[i]*mins[i], 1.0)
-            vol_eff_i = ts_rel_i * math.sqrt(max(fga_pms[i]*mins[i], 0))
-            
-            ts_s = normalize(ts_rel_i, -0.08, 0.08)
-            play_s = normalize(play_i, -1.0, 6.0)
-            def_s = normalize(def_i, 0.0, 4.5)
-            ftr_s = normalize(ftr_i, 0.05, 0.45)
-            vol_s = normalize(vol_eff_i, -0.1, 0.3)
-            
-            raw_i = (ts_s * 0.25 + play_s * 0.20 + def_s * 0.20 + ftr_s * 0.10 + vol_s * 0.25)
-            dr_i = min(99.9, 40.0 + (raw_i * 0.6))
-            dr_pms.append(dr_i / mins[i])
-            
-        if n >= 10:
-            avg_last3 = sum(dr_pms[-3:]) / 3 * avg_min
-            avg_prev7 = sum(dr_pms[:-3]) / 7 * avg_min
-        else:
-            avg_last3 = sum(dr_pms[-3:]) / len(dr_pms[-3:]) * avg_min
-            avg_prev7 = sum(dr_pms[:-3]) / len(dr_pms[:-3]) * avg_min if len(dr_pms[:-3]) > 0 else avg_last3
-            
-        overall_avg = sum(dr_pms) / n * avg_min
-        delta = avg_last3 - avg_prev7
-        if abs(delta) < 0.08 * overall_avg:
-            dr_trend = "stable"
-        elif delta > 0:
-            dr_trend = "up"
-        else:
-            dr_trend = "down"
-            
-        mean_pm = sum(dr_pms) / n
-        if mean_pm > 0:
-            var = sum((x - mean_pm)**2 for x in dr_pms) / n
-            std = math.sqrt(var)
-            cv = std / mean_pm
-        else:
-            cv = 0
-        dr_conf = max(20.0, min(95.0, 100.0 - 120.0 * cv))
-        
-        return {
-            "PTS": {"value": round(pts_proj, 1), "trend": pts_trend, "confidence": round(pts_conf, 1)},
-            "AST": {"value": round(ast_proj, 1), "trend": ast_trend, "confidence": round(ast_conf, 1)},
-            "REB": {"value": round(reb_proj, 1), "trend": reb_trend, "confidence": round(reb_conf, 1)},
-            "DraftRoomScore": {"value": round(dr_proj, 1), "trend": dr_trend, "confidence": round(dr_conf, 1)},
-            "avg_minutes": round(avg_min, 1)
-        }
+        return _compute_player_trajectory(player_id, season, games)
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        print(f"Error in get_player_trajectory for {player_id}: {e}")
+        logger.error(f"Error in get_player_trajectory for {player_id}: {e}")
         raise HTTPException(status_code=422, detail=f"Error computing trajectory: {str(e)}")
 
-def fetch_injury_report():
+def fetch_injury_report() -> dict:
     global _injury_cache, _injury_cache_reason, _injury_cache_type, _injury_cache_time
-    import requests, unicodedata
     now = time.time()
     if _injury_cache and (now - _injury_cache_time) < INJURY_CACHE_TTL:
         return _injury_cache
@@ -592,11 +581,10 @@ def fetch_injury_report():
         _injury_cache, _injury_cache_reason, _injury_cache_type, _injury_cache_time = new_cache, new_reason, new_type, now
         return _injury_cache
     except Exception as e:
-        print(f"Injury fetch error: {e}")
+        logger.error(f"Injury fetch error: {e}")
         return _injury_cache
 
-def get_injury_status(full_name: str):
-    import unicodedata
+def get_injury_status(full_name: str) -> tuple[str, str, str] | None:
     fetch_injury_report()
     key = ''.join(c for c in unicodedata.normalize('NFD', full_name.lower().strip()) if unicodedata.category(c) != 'Mn')
     status = _injury_cache.get(key)
@@ -606,12 +594,10 @@ def get_injury_status(full_name: str):
 
 class LineupOptimizeRequest(BaseModel):
     player_names: List[str]
-    season: str = "2025-26"
+    season: str = CURRENT_SEASON
 
 @app.post("/lineup/optimize", summary="Optimize a lineup of players")
-def optimize_lineup(request: LineupOptimizeRequest):
-    all_players = players.get_players()
-    
+def optimize_lineup(request: LineupOptimizeRequest) -> dict:
     resolved_players = []
     unresolved_names = []
     
@@ -619,14 +605,14 @@ def optimize_lineup(request: LineupOptimizeRequest):
         name_lower = name.lower()
         
         # 1. Exact full_name match
-        exact_match = next((p for p in all_players if p['full_name'].lower() == name_lower), None)
+        exact_match = next((p for p in ALL_PLAYERS if p['full_name'].lower() == name_lower), None)
         if exact_match:
             resolved_players.append({"name": name, "id": exact_match['id'], "full_name": exact_match['full_name']})
             continue
             
         # 2. All parts of the name are present in full_name
         parts = name_lower.split()
-        all_parts_match = next((p for p in all_players if all(part in p['full_name'].lower() for part in parts)), None)
+        all_parts_match = next((p for p in ALL_PLAYERS if all(part in p['full_name'].lower() for part in parts)), None)
         if all_parts_match:
             resolved_players.append({"name": name, "id": all_parts_match['id'], "full_name": all_parts_match['full_name']})
             continue
@@ -635,7 +621,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
         long_parts = [part for part in parts if len(part) > 3]
         any_part_match = None
         if long_parts:
-            any_part_match = next((p for p in all_players if any(part in p['full_name'].lower() for part in long_parts)), None)
+            any_part_match = next((p for p in ALL_PLAYERS if any(part in p['full_name'].lower() for part in long_parts)), None)
         if any_part_match:
             resolved_players.append({"name": name, "id": any_part_match['id'], "full_name": any_part_match['full_name']})
             continue
@@ -675,47 +661,13 @@ def optimize_lineup(request: LineupOptimizeRequest):
             dreb = sum(g.get('DREB') or 0 for g in recent_10) / 10
             reb = sum(g.get('REB') or 0 for g in recent_10) / 10
             
-            ts_denom = 2 * (fga + 0.44 * fta)
-            ts = (pts / ts_denom) if ts_denom > 0 else 0
-            ts_rel = ts - 0.56
-            
-            play = ast - (0.5 * tov)
-            def_impact = stl + (0.7 * blk) + (0.3 * dreb)
-            ftr = fta / max(fga, 1.0)
-            vol_eff = ts_rel * math.sqrt(fga)
-            
-            def normalize(val, min_val, max_val):
-                return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
-                
-            ts_rel_score = normalize(ts_rel, -0.08, 0.08)
-            play_score = normalize(play, -1.0, 6.0)
-            def_score = normalize(def_impact, 0.0, 4.5)
-            ftr_score = normalize(ftr, 0.05, 0.45)
-            vol_eff_score = normalize(vol_eff, -0.1, 0.3)
-            
-            raw_score = (
-                ts_rel_score * 0.25 +
-                play_score * 0.20 +
-                def_score * 0.20 +
-                ftr_score * 0.10 +
-                vol_eff_score * 0.25
-            )
-            
-            dr_score = min(99.9, 40.0 + (raw_score * 0.6))
+            dr_score, _ = calculate_dr_score(pts, fga, fta, ast, tov, stl, blk, dreb)
             dr_score = round(dr_score, 1)
             
             # Minutes trend: avg last 3 games vs avg prior 7
             last_3 = recent_10[:3]
             prior_7 = recent_10[3:10]
             
-            def parse_min(m):
-                if isinstance(m, str) and ':' in m:
-                    pts_arr = m.split(':')
-                    return float(pts_arr[0]) + float(pts_arr[1])/60.0
-                elif m is not None:
-                    return float(m)
-                return 0.0
-                
             min_last_3 = sum(parse_min(g.get('MIN')) for g in last_3) / 3
             min_prior_7 = sum(parse_min(g.get('MIN')) for g in prior_7) / 7
             min_delta = min_last_3 - min_prior_7
@@ -740,30 +692,8 @@ def optimize_lineup(request: LineupOptimizeRequest):
                 g_blk = g.get('BLK') or 0
                 g_dreb = g.get('DREB') or 0
                 
-                g_ts_denom = 2 * (g_fga + 0.44 * g_fta)
-                g_ts = (g_pts / g_ts_denom) if g_ts_denom > 0 else 0
-                g_ts_rel = g_ts - 0.56
-                
-                g_play = g_ast - (0.5 * g_tov)
-                g_def_impact = g_stl + (0.7 * g_blk) + (0.3 * g_dreb)
-                g_ftr = g_fta / max(g_fga, 1.0)
-                g_vol_eff = g_ts_rel * math.sqrt(g_fga)
-                
-                g_ts_rel_score = normalize(g_ts_rel, -0.08, 0.08)
-                g_play_score = normalize(g_play, -1.0, 6.0)
-                g_def_score = normalize(g_def_impact, 0.0, 4.5)
-                g_ftr_score = normalize(g_ftr, 0.05, 0.45)
-                g_vol_eff_score = normalize(g_vol_eff, -0.1, 0.3)
-                
-                g_raw_score = (
-                    g_ts_rel_score * 0.25 +
-                    g_play_score * 0.20 +
-                    g_def_score * 0.20 +
-                    g_ftr_score * 0.10 +
-                    g_vol_eff_score * 0.25
-                )
-                
-                return min(99.9, 40.0 + (g_raw_score * 0.6))
+                dr_score, _ = calculate_dr_score(g_pts, g_fga, g_fta, g_ast, g_tov, g_stl, g_blk, g_dreb)
+                return dr_score
                 
             dr_last_3 = sum(calc_dr_for_game(g) for g in last_3) / 3
             dr_prior_7 = sum(calc_dr_for_game(g) for g in prior_7) / 7
@@ -935,7 +865,7 @@ def optimize_lineup(request: LineupOptimizeRequest):
     }
 
 @app.get("/players/{player_id}", summary="Get comprehensive individual player info")
-def get_player_info(player_id: int):
+def get_player_info(player_id: int) -> dict:
     """
     Fetches detailed player info including height, weight, draft info, 
     current team, and headline stats (PTS, AST, REB averages).
@@ -945,7 +875,7 @@ def get_player_info(player_id: int):
         # get_normalized_dict() converts the pandas DataFrames to standard Python dicts
         return info.get_normalized_dict()
     except Exception as e:
-        print(f"Error in get_player_info for {player_id}: {e}")
+        logger.error(f"Error in get_player_info for {player_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching player info: {str(e)}")
 
 if __name__ == "__main__":
