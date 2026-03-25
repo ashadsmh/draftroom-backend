@@ -380,6 +380,9 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
             s3 = [r for r in s2 if r["stats"]["pts"] < 28]
             logger.info(f"After pts < 28 filter: {len(s3)} players remain")
             
+            for r in s3:
+                logger.info(f"Candidate: {r.get('name')}, avg_minutes: {r.get('avg_minutes', 0)}, delta: {r.get('delta', 0)}, pts: {r['stats']['pts']}")
+            
             s4 = [r for r in s3 if r.get("avg_minutes", 0) >= min_minutes]
             logger.info(f"After avg_minutes >= {min_minutes} filter: {len(s4)} players remain")
             
