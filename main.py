@@ -388,7 +388,7 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
             
             return s5
             
-        breakout_candidates = filter_candidates(18, -2)
+        breakout_candidates = filter_candidates(12, -5)
         
         def breakout_score(r):
             trend = r.get("trend", "stable")
@@ -399,7 +399,7 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         
         if len(breakout_alerts) < 3:
             logger.warning("Fewer than 3 candidates passed relaxed filters. Using fallback.")
-            fallback_candidates = [r for r in results if r["id"] not in ALL_STAR_IDS and r.get("avg_minutes", 0) >= 15]
+            fallback_candidates = [r for r in results if r["id"] not in ALL_STAR_IDS and r.get("avg_minutes", 0) >= 12 and r["delta"] >= -5]
             fallback_candidates = sorted(fallback_candidates, key=lambda x: x["score"], reverse=True)
             
             seen = {r["id"] for r in breakout_alerts}
