@@ -1,5 +1,6 @@
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
 nba_api
 requests
+pydantic
+python-multipart
