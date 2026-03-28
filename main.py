@@ -11,7 +11,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import commonplayerinfo, playergamelog
-from nba_api.library.http import NBAHTTP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,35 +20,131 @@ CURRENT_SEASON = "2025-26"
 ALL_PLAYERS = players.get_players()
 PLAYER_DICT = {p['id']: p for p in ALL_PLAYERS}
 
-NBAHTTP.headers = {
-    "Host": "stats.nba.com",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "x-nba-stats-origin": "stats",
-    "x-nba-stats-token": "true",
-    "Connection": "keep-alive",
-    "Referer": "https://www.nba.com/",
-    "Origin": "https://www.nba.com"
-}
-
 app = FastAPI(
     title="DraftRoom API",
     description="NBA Analytics API using nba_api for rich player data and game logs.",
     version="1.0.0"
 )
 
+async def _background_cache_refresher():
+    """Proactively refresh batch cache before it expires."""
+    while True:
+        try:
+            # Wait until 30 minutes before cache expires
+            sleep_time = max(BATCH_CACHE_TTL - 1800, 3600)
+            logger.info(f"Cache refresher sleeping for {sleep_time}s before next refresh...")
+            await asyncio.sleep(sleep_time)
+            logger.info("Proactive cache refresh starting...")
+            loop = asyncio.get_event_loop()
+            # Clear cache first to force a fresh fetch
+            global _batch_cache, _batch_cache_time
+            _batch_cache = {}
+            _batch_cache_time = 0
+            await loop.run_in_executor(None, get_batch_scores)
+            logger.info("Proactive cache refresh complete.")
+        except Exception as e:
+            logger.error(f"Background cache refresh failed: {e}")
+            await asyncio.sleep(1800)  # retry in 30 mins if failed
+
 @app.on_event("startup")
 async def startup_event():
-    asyncio.get_event_loop().run_in_executor(None, get_batch_scores)
+    global _batch_cache, _batch_cache_time
+    _batch_cache = {}
+    _batch_cache_time = 0
+    logger.info("Server started. Scheduling cache pre-warm in 10 seconds...")
+    
+    async def delayed_warm():
+        await asyncio.sleep(10)
+        logger.info("Starting cache pre-warm...")
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, get_batch_scores)
+            logger.info("Cache pre-warm complete.")
+        except Exception as e:
+            logger.error(f"Cache pre-warm failed: {e}")
+        # Start the background refresher after initial warm
+        asyncio.create_task(_background_cache_refresher())
+    
+    asyncio.create_task(delayed_warm())
 
-ALL_STAR_IDS = {2544, 115, 203999, 203507, 1629029, 1628983, 1630162, 1628369, 1626164, 1641705, 1630595, 1630169, 201142, 1628384, 1628973, 1630214, 203497, 1629627, 1628464, 1641784, 1630578, 1631094, 1630581, 1629675, 1628402}
+@app.get("/health")
+def health():
+    now = time.time()
+    cache_age = int(now - _batch_cache_time) if _batch_cache_time else None
+    cache_expires_in = max(0, BATCH_CACHE_TTL - cache_age) if cache_age is not None else None
+    return {
+        "status": "ok",
+        "player_dict_size": len(PLAYER_DICT),
+        "cache_warm": bool(_batch_cache),
+        "cache_age_seconds": cache_age,
+        "cache_expires_in_seconds": cache_expires_in,
+        "leaderboard_size": len(_batch_cache.get("leaderboard", [])),
+        "breakout_size": len(_batch_cache.get("breakout_alerts", []))
+    }
 
-BREAKOUT_CANDIDATE_IDS = [
-    1630224, 1630578, 1631094, 1630581, 1630214, 1629628, 1628402, 1629675, 1631096, 1630559,
-    1630162, 1630169, 1629029, 1628983, 1641705, 1628369, 1626164, 203999, 203507, 115
-]
+
+
+@app.post("/admin/clear-cache")
+def clear_cache():
+    global _batch_cache, _batch_cache_time, _gamelog_cache, _gamelog_cache_time
+    _batch_cache = {}
+    _batch_cache_time = 0
+    _gamelog_cache = {}
+    _gamelog_cache_time = {}
+    return {"cleared": True}
+
+ALL_STAR_IDS = {
+    # Active players who have ever been named an NBA All-Star
+    2544,    # LeBron James
+    201939,  # Stephen Curry
+    203999,  # Nikola Jokic
+    203507,  # Giannis Antetokounmpo
+    1629029, # Luka Doncic
+    1628983, # Shai Gilgeous-Alexander
+    1630162, # Anthony Edwards
+    1628369, # Jayson Tatum
+    1641705, # Victor Wembanyama
+    201142,  # Kevin Durant
+    1628384, # Devin Booker
+    1628973, # Jaylen Brown
+    1630214, # Jalen Brunson
+    203497,  # Karl-Anthony Towns
+    1629627, # De'Aaron Fox
+    1630578, # Scottie Barnes
+    1629675, # Jaren Jackson Jr.
+    1631096, # Chet Holmgren
+    1629628, # Alperen Sengun
+    1630581, # Jalen Johnson
+    1628464, # LeBron James (duplicate safety)
+    202710,  # Jimmy Butler III
+    2199,    # Ja Morant
+    1626167, # Donovan Mitchell
+    203954,  # Joel Embiid
+    1628389, # Bam Adebayo
+    1627736, # Jaylen Brown (duplicate safety)
+    203076,  # Anthony Davis
+    1626164, # Pascal Siakam
+    1630595, # Cade Cunningham
+    1630169, # Tyrese Maxey
+    1628384, # Devin Booker (duplicate safety)
+    203497,  # Karl-Anthony Towns (duplicate safety)
+    1629003, # Zion Williamson
+    1627783, # Rudy Gobert
+    203110,  # Draymond Green
+    1626156, # Devin Booker (duplicate safety)
+    201935,  # James Harden
+    203081,  # Damian Lillard
+    1628370, # Jayson Tatum (duplicate safety)
+    203932,  # Andrew Wiggins
+    1626209, # Nikola Vucevic
+    203500,  # Rudy Gobert (duplicate safety)
+    1629630, # Jordan Poole
+    201566,  # Russell Westbrook
+    201950,  # Paul George
+    203468,  # Victor Oladipo
+    1626157, # Devin Booker (duplicate safety)
+    1628386, # Jaylen Brown (duplicate safety)
+}
 
 DEF_RTG = {
     "ATL": 118.4, "BOS": 110.5, "BKN": 115.4, "CHA": 119.2, "CHI": 115.7,
@@ -60,8 +155,32 @@ DEF_RTG = {
     "SAC": 114.4, "SAS": 115.6, "TOR": 118.1, "UTA": 119.5, "WAS": 118.9
 }
 
+def normalize_name(name: str) -> str:
+    """Strip diacritics and lowercase for fuzzy name matching."""
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', name.lower().strip())
+        if unicodedata.category(c) != 'Mn'
+    )
+
 def normalize(val: float, min_val: float, max_val: float) -> float:
     return max(0.0, min(100.0, ((val - min_val) / (max_val - min_val)) * 100.0))
+
+def gamelog_to_records(gamelog_endpoint) -> list:
+    """Convert a PlayerGameLog endpoint response to a list of game dicts.
+    Uses the pre-parsed player_game_log DataSet instead of get_normalized_dict()
+    to handle both legacy and V3 NBA API response formats."""
+    try:
+        ds = gamelog_endpoint.player_game_log.get_dict()
+        headers = ds.get('headers', [])
+        rows = ds.get('data', [])
+        if not headers or not rows:
+            return []
+        # Handle nested header format (V3 API)
+        if isinstance(headers[0], dict):
+            headers = headers[0].get('columnNames', [])
+        return [dict(zip(headers, row)) for row in rows]
+    except Exception:
+        return []
 
 def parse_min(m: str | int | float) -> float:
     if isinstance(m, str) and ':' in m:
@@ -259,8 +378,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
+        "http://localhost:5173",
         "https://draftroom-frontend.vercel.app",
-        "https://*.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -275,8 +394,8 @@ def search_players(query: str = Query(..., min_length=1, description="Player nam
     """
     try:
         # Case-insensitive search
-        matched = [p for p in ALL_PLAYERS if query.lower() in p['full_name'].lower()]
-        
+         
+        matched = [p for p in ALL_PLAYERS if normalize_name(query) in normalize_name(p['full_name'])]
         # Sort active players to the top
         matched.sort(key=lambda x: not x.get('is_active', False))
         
@@ -287,7 +406,11 @@ def search_players(query: str = Query(..., min_length=1, description="Player nam
 
 _batch_cache: dict = {}
 _batch_cache_time: float = 0
-BATCH_CACHE_TTL = 7200  # 2 hours
+BATCH_CACHE_TTL = 21600  # 6 hours
+
+_gamelog_cache: dict = {}
+_gamelog_cache_time: dict = {}
+GAMELOG_CACHE_TTL = 10800  # 3 hours
 
 @app.get("/players/batch-scores", summary="Get batch scores for multiple players")
 def get_batch_scores(player_ids: str = Query(None, description="Comma-separated player IDs"), season: str = Query(CURRENT_SEASON)) -> dict:
@@ -297,36 +420,55 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         return _batch_cache  # instant return
 
     try:
-        main_pool = [2544, 115, 203999, 203507, 1629029, 1628983, 1630162, 1628369, 1626164, 1641705, 1630595, 1630169]
-        breakout_pool = BREAKOUT_CANDIDATE_IDS
-        
-        eval_pool = list(set(main_pool + breakout_pool))
+        eval_pool = [
+            2544, 203999, 203507, 1629029, 1628983, 1630162, 1628369, 1626164,
+            1641705, 1630595, 1630169, 1630578, 1631094, 1630581, 1629675,
+            1628973, 1629627, 1628402, 1628384, 1630214, 203497, 1629628,
+            1630224, 1630532, 1630596, 1631096, 202710, 1629630, 1631095,
+            1631110, 201939, 1628378, 1628386, 203500
+        ]
         
         def fetch_data(pid):
             def _do_fetch():
-                info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=8).get_normalized_dict()
+                time.sleep(1.0)
+                if not PLAYER_DICT.get(pid, {}).get('is_active', False):
+                    logger.warning(f"Player {pid} is inactive. Skipping.")
+                    return None
+
+                info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=10).get_normalized_dict()
                 p_info = info.get('CommonPlayerInfo', [{}])[0]
                 headline = info.get('PlayerHeadlineStats', [{}])[0]
                 
                 try:
-                    gamelog = playergamelog.PlayerGameLog(player_id=pid, season=season, timeout=10)
-                    data = gamelog.get_normalized_dict()
-                    games = data.get("PlayerGameLog", [])
+                    gamelog = playergamelog.PlayerGameLog(player_id=pid, season=season, timeout=12)
+                    games = gamelog_to_records(gamelog)
                 except Exception:
+                    logger.warning(f"Gamelog fetch failed for {pid}, games=[]")
                     games = []
                 
                 try:
                     dr_res = _compute_draftroom_score(player_id=pid, season=season, games=games)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"DR score failed for {pid}: {e}")
                     dr_res = None
                     
                 try:
                     traj_res = _compute_player_trajectory(player_id=pid, season=season, games=games)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Trajectory failed for {pid}: {e}")
                     traj_res = None
                     
                 score = dr_res.get("draftroom_score", 0) if dr_res else 0
                 projected_score = traj_res.get("DraftRoomScore", {}).get("value", 0) if traj_res else 0
+                
+                if traj_res:
+                    avg_minutes = traj_res.get("avg_minutes", 0)
+                else:
+                    if games:
+                        recent = games[:10]
+                        avg_minutes = sum(parse_min(g.get('MIN', 0)) for g in recent) / len(recent)
+                    else:
+                        avg_minutes = 0
                 
                 return {
                     "id": pid,
@@ -342,84 +484,59 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
                         "reb": headline.get("REB", 0)
                     },
                     "delta": projected_score - score,
-                    "avg_minutes": traj_res.get("avg_minutes", 0) if traj_res else 0
+                    "avg_minutes": round(avg_minutes, 1)
                 }
 
-            try:
-                with ThreadPoolExecutor(max_workers=1) as ex:
-                    return ex.submit(_do_fetch).result(timeout=8)
-            except Exception as e:
-                logger.error(f"Error fetching {pid}: {e}")
-                return None
+            for attempt in range(3):
+                try:
+                    result = _do_fetch()
+                    if result is not None:
+                        return result
+                except Exception as e:
+                    if attempt == 2:
+                        logger.error(f"fetch_data failed after 3 attempts for {pid}: {type(e).__name__}: {e}")
+                        return None
+                    logger.warning(f"fetch_data attempt {attempt + 1} failed for {pid}: {e}. Retrying...")
+                    time.sleep(1.5 * (attempt + 1))
+            return None
                 
         results = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {executor.submit(fetch_data, pid): pid for pid in eval_pool}
             for future in as_completed(futures):
                 res = future.result()
                 if res:
                     results.append(res)
                     
-        main_results = [r for r in results if r["id"] in main_pool]
-        top_prospects = sorted(main_results, key=lambda x: x["score"], reverse=True)[:6]
-        
-        def filter_candidates(min_minutes, min_delta):
-            logger.info(f"Starting filter with {len(results)} players")
-            
-            s1 = [r for r in results if r["id"] not in ALL_STAR_IDS]
-            logger.info(f"After ALL_STAR_IDS filter: {len(s1)} players remain")
-            
-            s2 = []
-            for r in s1:
-                static_info = PLAYER_DICT.get(r["id"], {})
-                career_games = static_info.get("career_games")
-                if career_games is None or career_games < 400:
-                    s2.append(r)
-            logger.info(f"After career_games < 400 filter: {len(s2)} players remain")
-            
-            s3 = [r for r in s2 if r["stats"]["pts"] < 28]
-            logger.info(f"After pts < 28 filter: {len(s3)} players remain")
-            
-            for r in s3:
-                logger.info(f"Candidate: {r.get('name')}, avg_minutes: {r.get('avg_minutes', 0)}, delta: {r.get('delta', 0)}, pts: {r['stats']['pts']}")
-            
-            s4 = [r for r in s3 if r.get("avg_minutes", 0) >= min_minutes]
-            logger.info(f"After avg_minutes >= {min_minutes} filter: {len(s4)} players remain")
-            
-            s5 = [r for r in s4 if r["delta"] >= min_delta]
-            logger.info(f"After delta >= {min_delta} filter: {len(s5)} players remain")
-            
-            return s5
-            
-        breakout_candidates = filter_candidates(12, -5)
-        
-        def breakout_score(r):
-            trend = r.get("trend", "stable")
-            bonus = 2.0 if trend == "up" else (0.0 if trend == "stable" else -1.0)
-            return r["delta"] + bonus
-            
-        breakout_alerts = sorted(breakout_candidates, key=breakout_score, reverse=True)[:3]
-        
-        if len(breakout_alerts) < 3:
-            logger.warning("Fewer than 3 candidates passed relaxed filters. Using fallback.")
-            fallback_candidates = [r for r in results if r["id"] not in ALL_STAR_IDS and r.get("avg_minutes", 0) >= 12 and r["delta"] >= -5]
-            fallback_candidates = sorted(fallback_candidates, key=lambda x: x["score"], reverse=True)
-            
-            seen = {r["id"] for r in breakout_alerts}
-            for r in fallback_candidates:
-                if r["id"] not in seen:
-                    breakout_alerts.append(r)
-                    seen.add(r["id"])
-                if len(breakout_alerts) >= 3:
-                    break
-        
-        combined = {r["id"]: r for r in top_prospects + breakout_alerts}.values()
+        all_scored = sorted(
+            [r for r in results if r["score"] > 0],
+            key=lambda x: x["score"],
+            reverse=True
+        )
+        leaderboard = all_scored[:25]
+
+        breakout_alerts = sorted(
+            [
+                r for r in all_scored
+                if int(r["id"]) not in ALL_STAR_IDS
+                and float(r.get("avg_minutes", 0)) >= 15.0
+            ],
+            key=lambda x: x["score"],
+            reverse=True
+        )[:6]
+
+        logger.info(f"Leaderboard: {[r['name'] for r in leaderboard]}")
+        logger.info(f"Breakout alerts: {[r['name'] for r in breakout_alerts]}")
+        logger.info(f"Breakout candidates after filter: {[(r['name'], r['avg_minutes']) for r in breakout_alerts]}")
         
         result = {
-            "data": list(combined),
-            "top_prospects": top_prospects,
+            "data": leaderboard,
+            "leaderboard": leaderboard,
             "breakout_alerts": breakout_alerts
         }
+        if not leaderboard:
+            logger.error("Empty leaderboard — skipping cache write.")
+            raise HTTPException(status_code=503, detail="No player data returned. nba_api may be rate limiting. Retry in 30s.")
         _batch_cache = result
         _batch_cache_time = now
         return result
@@ -434,11 +551,33 @@ def get_player_gamelog(player_id: int, season: str = Query(CURRENT_SEASON, descr
     Defaults to the 2025-26 NBA season. Includes rich stats like PTS, AST, REB, FG%, STL, BLK, plus advanced metrics if available.
     """
     try:
-        gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=10)
-        return gamelog.get_normalized_dict()
+        games = _get_games_cached(player_id, season)
+        return {"PlayerGameLog": games}
     except Exception as e:
         logger.error(f"Error in get_player_gamelog for {player_id}: {e}")
         raise HTTPException(status_code=422, detail=f"Error fetching game logs: {str(e)}")
+
+def _get_games_cached(player_id: int, season: str) -> list:
+    """Fetch gamelog using cache, falling back to fresh API call."""
+    global _gamelog_cache, _gamelog_cache_time
+    now = time.time()
+    cache_key = (player_id, season)
+    if cache_key in _gamelog_cache and (now - _gamelog_cache_time.get(cache_key, 0)) < GAMELOG_CACHE_TTL:
+        logger.info(f"Gamelog cache hit for player {player_id}")
+        return _gamelog_cache[cache_key]
+    for attempt in range(3):
+        try:
+            gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=15)
+            games = gamelog_to_records(gamelog)
+            _gamelog_cache[cache_key] = games
+            _gamelog_cache_time[cache_key] = now
+            return games
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            logger.warning(f"Gamelog fetch attempt {attempt + 1} failed for {player_id}: {e}. Retrying...")
+            time.sleep(1.5 * (attempt + 1))
+    return []
 
 @app.get("/players/{player_id}/draftroom-score", summary="Compute DraftRoom efficiency score")
 def get_draftroom_score(player_id: int, season: str = Query(CURRENT_SEASON, description="NBA Season format YYYY-YY")) -> dict:
@@ -446,9 +585,7 @@ def get_draftroom_score(player_id: int, season: str = Query(CURRENT_SEASON, desc
     Computes a weighted efficiency score from 0-100 based on the last 10 games.
     """
     try:
-        gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=10)
-        data = gamelog.get_normalized_dict()
-        games = data.get("PlayerGameLog", [])
+        games = _get_games_cached(player_id, season)
         
         if len(games) < 5:
             raise HTTPException(status_code=422, detail="Not enough games to compute score (minimum 5).")
@@ -486,9 +623,7 @@ def get_draftroom_score(player_id: int, season: str = Query(CURRENT_SEASON, desc
 @app.get("/players/{player_id}/dr-history", summary="Get per-game DR Score history")
 def get_dr_history(player_id: int, games: str = Query("20", description="Number of games: 10, 20, 40, or season"), season: str = Query(CURRENT_SEASON)) -> dict:
     try:
-        gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=10)
-        data = gamelog.get_normalized_dict()
-        games_list = data.get("PlayerGameLog", [])
+        games_list = _get_games_cached(player_id, season)
         
         if len(games_list) < 3:
             raise HTTPException(status_code=422, detail="Not enough games for history.")
@@ -528,7 +663,7 @@ def get_dr_history(player_id: int, games: str = Query("20", description="Number 
                 "reb": float(g.get("REB") or 0)
             })
             
-        return history
+        return {"history": history}
     except HTTPException:
         raise
     except Exception as e:
@@ -538,9 +673,7 @@ def get_dr_history(player_id: int, games: str = Query("20", description="Number 
 @app.get("/players/{player_id}/trajectory", summary="Get 5-game projection")
 def get_player_trajectory(player_id: int, season: str = Query(CURRENT_SEASON, description="NBA Season format YYYY-YY")) -> dict:
     try:
-        gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=10)
-        data = gamelog.get_normalized_dict()
-        games = data.get("PlayerGameLog", [])
+        games = _get_games_cached(player_id, season)
         
         return _compute_player_trajectory(player_id, season, games)
     except HTTPException:
@@ -605,17 +738,17 @@ def optimize_lineup(request: LineupOptimizeRequest) -> dict:
     unresolved_names = []
     
     for name in request.player_names:
-        name_lower = name.lower()
+        name_normalized = normalize_name(name)
         
         # 1. Exact full_name match
-        exact_match = next((p for p in ALL_PLAYERS if p['full_name'].lower() == name_lower), None)
+        exact_match = next((p for p in ALL_PLAYERS if normalize_name(p['full_name']) == name_normalized), None)
         if exact_match:
             resolved_players.append({"name": name, "id": exact_match['id'], "full_name": exact_match['full_name']})
             continue
             
         # 2. All parts of the name are present in full_name
-        parts = name_lower.split()
-        all_parts_match = next((p for p in ALL_PLAYERS if all(part in p['full_name'].lower() for part in parts)), None)
+        parts = name_normalized.split()
+        all_parts_match = next((p for p in ALL_PLAYERS if all(part in normalize_name(p['full_name']) for part in parts)), None)
         if all_parts_match:
             resolved_players.append({"name": name, "id": all_parts_match['id'], "full_name": all_parts_match['full_name']})
             continue
@@ -624,7 +757,7 @@ def optimize_lineup(request: LineupOptimizeRequest) -> dict:
         long_parts = [part for part in parts if len(part) > 3]
         any_part_match = None
         if long_parts:
-            any_part_match = next((p for p in ALL_PLAYERS if any(part in p['full_name'].lower() for part in long_parts)), None)
+            any_part_match = next((p for p in ALL_PLAYERS if any(part in normalize_name(p['full_name']) for part in long_parts)), None)
         if any_part_match:
             resolved_players.append({"name": name, "id": any_part_match['id'], "full_name": any_part_match['full_name']})
             continue
@@ -632,21 +765,38 @@ def optimize_lineup(request: LineupOptimizeRequest) -> dict:
         unresolved_names.append(name)
         
     def process_player(player_info):
+        time.sleep(0.4)
         pid = player_info['id']
         original_name = player_info['name']
         resolved_name = player_info['full_name']
         
         try:
-            # Fetch CommonPlayerInfo
-            info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=10).get_normalized_dict()
+            # Fetch CommonPlayerInfo with retry
+            info = None
+            for attempt in range(3):
+                try:
+                    info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=15).get_normalized_dict()
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise e
+                    time.sleep(1.5)
+            
             p_info = info.get('CommonPlayerInfo', [{}])[0]
             position = p_info.get("POSITION", "")
             team_abbr = p_info.get("TEAM_ABBREVIATION", "")
             
-            # Fetch PlayerGameLog
-            gamelog = playergamelog.PlayerGameLog(player_id=pid, season=request.season, timeout=10)
-            data = gamelog.get_normalized_dict()
-            games_list = data.get("PlayerGameLog", [])
+            # Fetch PlayerGameLog with cache
+            cache_key = (pid, request.season)
+            now = time.time()
+            if cache_key in _gamelog_cache and (now - _gamelog_cache_time.get(cache_key, 0)) < GAMELOG_CACHE_TTL:
+                logger.info(f"Gamelog cache hit for {pid} in optimize_lineup")
+                games_list = _gamelog_cache[cache_key]
+            else:
+                gamelog = playergamelog.PlayerGameLog(player_id=pid, season=request.season, timeout=15)
+                games_list = gamelog_to_records(gamelog)
+                _gamelog_cache[cache_key] = games_list
+                _gamelog_cache_time[cache_key] = now
             
             if len(games_list) < 10:
                 raise ValueError("Not enough games (minimum 10) to compute stats.")
@@ -822,6 +972,7 @@ def optimize_lineup(request: LineupOptimizeRequest) -> dict:
                 "tier": tier,
                 "reasons": reasons,
                 "injury_status": injury_status,
+                "injury_reason": injury_reason,
                 "stats": {
                     "pts": round(pts, 1),
                     "ast": round(ast, 1),
@@ -842,7 +993,7 @@ def optimize_lineup(request: LineupOptimizeRequest) -> dict:
     valid_players = []
     errored_players = []
     
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(process_player, p): p for p in resolved_players}
         for future in as_completed(futures):
             res = future.result()
@@ -881,11 +1032,10 @@ def get_player_info(player_id: int) -> dict:
         logger.error(f"Error in get_player_info for {player_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching player info: {str(e)}")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-# redeploy
-
 @app.get("/ping")
 def ping():
     return {"pong": True}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
