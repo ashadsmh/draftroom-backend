@@ -12,6 +12,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import commonplayerinfo, playergamelog
 
+NBA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+    "Connection": "keep-alive",
+}
+from nba_api.stats.library import http
+http.HEADERS.update(NBA_HEADERS)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -82,7 +96,9 @@ def health():
         "breakout_size": len(_batch_cache.get("breakout_alerts", []))
     }
 
-
+@app.get("/ping")
+def ping():
+    return {"pong": True}
 
 @app.post("/admin/clear-cache")
 def clear_cache():
@@ -380,6 +396,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://draftroom-frontend.vercel.app",
+        "https://*.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -430,17 +447,17 @@ def get_batch_scores(player_ids: str = Query(None, description="Comma-separated 
         
         def fetch_data(pid):
             def _do_fetch():
-                time.sleep(1.0)
+                time.sleep(2.0)
                 if not PLAYER_DICT.get(pid, {}).get('is_active', False):
                     logger.warning(f"Player {pid} is inactive. Skipping.")
                     return None
 
-                info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=10).get_normalized_dict()
+                info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=30).get_normalized_dict()
                 p_info = info.get('CommonPlayerInfo', [{}])[0]
                 headline = info.get('PlayerHeadlineStats', [{}])[0]
                 
                 try:
-                    gamelog = playergamelog.PlayerGameLog(player_id=pid, season=season, timeout=12)
+                    gamelog = playergamelog.PlayerGameLog(player_id=pid, season=season, timeout=30)
                     games = gamelog_to_records(gamelog)
                 except Exception:
                     logger.warning(f"Gamelog fetch failed for {pid}, games=[]")
@@ -567,7 +584,7 @@ def _get_games_cached(player_id: int, season: str) -> list:
         return _gamelog_cache[cache_key]
     for attempt in range(3):
         try:
-            gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=15)
+            gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season, timeout=30)
             games = gamelog_to_records(gamelog)
             _gamelog_cache[cache_key] = games
             _gamelog_cache_time[cache_key] = now
@@ -775,7 +792,7 @@ def optimize_lineup(request: LineupOptimizeRequest) -> dict:
             info = None
             for attempt in range(3):
                 try:
-                    info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=15).get_normalized_dict()
+                    info = commonplayerinfo.CommonPlayerInfo(player_id=pid, timeout=30).get_normalized_dict()
                     break
                 except Exception as e:
                     if attempt == 2:
@@ -793,7 +810,7 @@ def optimize_lineup(request: LineupOptimizeRequest) -> dict:
                 logger.info(f"Gamelog cache hit for {pid} in optimize_lineup")
                 games_list = _gamelog_cache[cache_key]
             else:
-                gamelog = playergamelog.PlayerGameLog(player_id=pid, season=request.season, timeout=15)
+                gamelog = playergamelog.PlayerGameLog(player_id=pid, season=request.season, timeout=30)
                 games_list = gamelog_to_records(gamelog)
                 _gamelog_cache[cache_key] = games_list
                 _gamelog_cache_time[cache_key] = now
@@ -1031,10 +1048,6 @@ def get_player_info(player_id: int) -> dict:
     except Exception as e:
         logger.error(f"Error in get_player_info for {player_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching player info: {str(e)}")
-
-@app.get("/ping")
-def ping():
-    return {"pong": True}
 
 if __name__ == "__main__":
     import uvicorn
