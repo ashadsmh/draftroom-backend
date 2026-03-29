@@ -34,6 +34,14 @@ CURRENT_SEASON = "2025-26"
 ALL_PLAYERS = players.get_players()
 PLAYER_DICT = {p['id']: p for p in ALL_PLAYERS}
 
+_batch_cache: dict = {}
+_batch_cache_time: float = 0
+BATCH_CACHE_TTL = 21600  # 6 hours
+
+_gamelog_cache: dict = {}
+_gamelog_cache_time: dict = {}
+GAMELOG_CACHE_TTL = 10800  # 3 hours
+
 app = FastAPI(
     title="DraftRoom API",
     description="NBA Analytics API using nba_api for rich player data and game logs.",
@@ -420,14 +428,6 @@ def search_players(query: str = Query(..., min_length=1, description="Player nam
     except Exception as e:
         logger.error(f"Error in search_players: {e}")
         raise HTTPException(status_code=500, detail=f"Error searching players: {str(e)}")
-
-_batch_cache: dict = {}
-_batch_cache_time: float = 0
-BATCH_CACHE_TTL = 21600  # 6 hours
-
-_gamelog_cache: dict = {}
-_gamelog_cache_time: dict = {}
-GAMELOG_CACHE_TTL = 10800  # 3 hours
 
 @app.get("/players/batch-scores", summary="Get batch scores for multiple players")
 def get_batch_scores(player_ids: str = Query(None, description="Comma-separated player IDs"), season: str = Query(CURRENT_SEASON)) -> dict:
