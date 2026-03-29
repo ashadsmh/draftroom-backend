@@ -23,6 +23,8 @@ NBA_HEADERS = {
     "Referer": "https://www.nba.com/",
     "Connection": "keep-alive",
 }
+from nba_api.stats.library import http
+http.HEADERS.update(NBA_HEADERS)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -402,7 +404,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://draftroom-frontend.vercel.app",
-        "https://*.vercel.app",
+        "https://draftroom-co.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
