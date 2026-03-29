@@ -23,8 +23,6 @@ NBA_HEADERS = {
     "Referer": "https://www.nba.com/",
     "Connection": "keep-alive",
 }
-from nba_api.stats.library import http
-http.HEADERS.update(NBA_HEADERS)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
